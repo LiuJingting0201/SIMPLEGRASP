@@ -39,8 +39,8 @@ EDGE_MARGIN = 20  # 从图像边缘采样桌子颜色的边距（像素）
 
 # 抓取参数
 TABLE_TOP_Z = 0.625
-PRE_GRASP_OFFSET = 0.25
-GRASP_OFFSET = 0.05
+PRE_GRASP_OFFSET = 0.12  # 预抓取高度（从物体顶部）
+GRASP_OFFSET = -0.005    # 抓取高度：物体顶部下方5mm（进入物体以抓取）
 POST_GRASP_OFFSET = 0.00
 LIFT_HEIGHT = 0.30
 GRIPPER_CLOSED = 0.00
@@ -266,9 +266,11 @@ def fast_grasp_test(robot_id, world_pos, grasp_angle, object_ids, visualize=Fals
         return False
     
     initial_z = {}
+    initial_pos = {}
     for obj_id in object_ids:
         pos, _ = p.getBasePositionAndOrientation(obj_id)
         initial_z[obj_id] = pos[2]
+        initial_pos[obj_id] = pos
     
     try:
         ori = p.getQuaternionFromEuler([np.pi, 0, grasp_angle])
@@ -280,12 +282,37 @@ def fast_grasp_test(robot_id, world_pos, grasp_angle, object_ids, visualize=Fals
         if not move_fast(robot_id, ee_link, pre_pos, ori, steps):
             return False
         
+        # 检查物体是否被推走（预抓取阶段不应该碰到物体）
+        for obj_id in object_ids:
+            pos, _ = p.getBasePositionAndOrientation(obj_id)
+            xy_dist = np.sqrt((pos[0]-initial_pos[obj_id][0])**2 + (pos[1]-initial_pos[obj_id][1])**2)
+            if xy_dist > 0.05:  # 移动超过5cm
+                if visualize:
+                    print(f"         ⚠️  预抓取时物体ID={obj_id}被推走 {xy_dist*100:.1f}cm")
+                return False
+        
         # 下降
         if visualize:
             print(f"         ↓ 下降...")
         grasp_pos = [world_pos[0], world_pos[1], world_pos[2] + GRASP_OFFSET]
+        if visualize:
+            print(f"            目标深度: Z={grasp_pos[2]:.3f}m (物体={world_pos[2]:.3f}m, offset={GRASP_OFFSET:+.3f}m)")
         if not move_fast(robot_id, ee_link, grasp_pos, ori, steps, slow=True):
             return False
+        
+        # 检查物体是否被推走（下降阶段轻微碰触是可以的）
+        for obj_id in object_ids:
+            pos, _ = p.getBasePositionAndOrientation(obj_id)
+            xy_dist = np.sqrt((pos[0]-initial_pos[obj_id][0])**2 + (pos[1]-initial_pos[obj_id][1])**2)
+            if xy_dist > 0.05:
+                if visualize:
+                    print(f"         ⚠️  下降时物体ID={obj_id}被推走 {xy_dist*100:.1f}cm")
+                return False
+        
+        # 检查实际到达的位置
+        if visualize:
+            actual_pos = p.getLinkState(robot_id, ee_link)[0]
+            print(f"            实际位置: [{actual_pos[0]:.3f}, {actual_pos[1]:.3f}, {actual_pos[2]:.3f}]")
         
         # 闭合夹爪
         if visualize:
@@ -294,9 +321,11 @@ def fast_grasp_test(robot_id, world_pos, grasp_angle, object_ids, visualize=Fals
         
         # 检查夹爪
         finger_state = p.getJointState(robot_id, 9)[0]
+        if visualize:
+            print(f"            夹爪状态: {finger_state:.4f} (0=完全打开, 应该>0.001)")
         if finger_state < 0.001:
             if visualize:
-                print(f"         ⚠️  夹爪未闭合")
+                print(f"         ⚠️  夹爪未闭合（物体太小或位置不对）")
             return False
         
         # 抬起
@@ -527,3 +556,35 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+
+def estimate_object_height(depth, object_mask, percentile=10):
+    """估计物体表面高度
+    
+    使用检测到的物体像素的深度值估计表面高度
+    使用较小百分位数来避免噪声和边缘效应
+    
+    Args:
+        depth: 深度图
+        object_mask: 物体mask
+        percentile: 使用的百分位数（默认10 = 最近的10%像素）
+    
+    Returns:
+        物体表面高度（世界坐标Z值）
+    """
+    obj_depths = depth[object_mask]
+    valid_depths = obj_depths[obj_depths > MIN_DEPTH]
+    
+    if len(valid_depths) == 0:
+        return None
+    
+    # 使用较小百分位数的深度值（最接近相机 = 最高点）
+    surface_depth = np.percentile(valid_depths, percentile)
+    
+    # 深度到世界Z的转换（简化版，假设俯视相机）
+    # 相机高度 = TABLE_TOP_Z + camera_distance
+    # 物体Z = 相机高度 - 深度
+    camera_height = TABLE_TOP_Z + 1.2  # CAMERA_DISTANCE = 1.2
+    object_z = camera_height - surface_depth
+    
+    return object_z
