@@ -52,156 +52,6 @@ def create_data_dirs():
     print(f"📁 数据目录: {DATA_DIR.absolute()}")
 
 
-def estimate_object_height(depth, object_mask, percentile=10):
-    """估计物体表面高度
-    
-    使用检测到的物体像素的深度值估计表面高度
-    使用较小百分位数来避免噪声和边缘效应
-    
-    Args:
-        depth: 深度图
-        object_mask: 物体mask
-        percentile: 使用的百分位数（默认10 = 最近的10%像素）
-    
-    Returns:
-        物体表面高度（世界坐标Z值）
-    """
-    obj_depths = depth[object_mask]
-    valid_depths = obj_depths[obj_depths > MIN_DEPTH]
-    
-    if len(valid_depths) == 0:
-        return None
-    
-    # 使用较小百分位数的深度值（最接近相机 = 最高点）
-    surface_depth = np.percentile(valid_depths, percentile)
-    
-    # 深度到世界Z的转换（简化版，假设俯视相机）
-    # 相机高度 = TABLE_TOP_Z + camera_distance
-    # 物体Z = 相机高度 - 深度
-    camera_height = TABLE_TOP_Z + 1.2  # CAMERA_DISTANCE = 1.2
-    object_z = camera_height - surface_depth
-    
-    return object_z
-
-
-def sample_grasp_candidates(depth, num_angles=NUM_ANGLES, visualize=False, rgb=None, view_matrix=None, proj_matrix=None, seg_mask=None, object_ids=None):
-    """基于PyBullet segmentation mask的物体分割策略 - 修复版"""
-    height, width = depth.shape
-    candidates = []
-    
-    if seg_mask is None or object_ids is None:
-        print(f"   ⚠️  需要segmentation mask和object IDs")
-        return candidates
-    
-    # ✨ 关键修复：首先检查是否真的有物体存在
-    if len(object_ids) == 0:
-        print(f"   ⚠️  物体列表为空，无候选点")
-        return candidates
-    
-    # Step 1: 使用PyBullet segmentation mask直接获取物体像素  
-    object_mask = np.zeros((height, width), dtype=bool)
-    valid_object_count = 0
-    
-    print(f"   🔍 分析物体像素...")
-    for obj_id in object_ids:
-        try:
-            # ✨ 强化验证：检查物体是否真的存在且在桌面上
-            pos, _ = p.getBasePositionAndOrientation(obj_id)
-            
-            # 检查物体是否在合理位置（在桌面上方，在工作区域内）
-            if (pos[2] < TABLE_TOP_Z or pos[2] > TABLE_TOP_Z + 0.3 or
-                abs(pos[0] - 0.6) > 0.4 or abs(pos[1]) > 0.4):
-                print(f"      物体 ID={obj_id}: 位置异常 [{pos[0]:.3f}, {pos[1]:.3f}, {pos[2]:.3f}]，跳过")
-                continue
-            
-            obj_pixels = (seg_mask == obj_id)
-            pixel_count = obj_pixels.sum()
-            print(f"      物体 ID={obj_id}: {pixel_count} 像素, 位置=[{pos[0]:.3f}, {pos[1]:.3f}, {pos[2]:.3f}]")
-            
-            if pixel_count > 5:  # 至少5个像素才认为是有效物体
-                object_mask |= obj_pixels
-                valid_object_count += 1
-        except:
-            # 物体不存在
-            print(f"      物体 ID={obj_id}: 不存在或无法访问")
-            continue
-    
-    # ✨ 关键修复：如果没有有效物体像素，明确返回空列表
-    if valid_object_count == 0 or object_mask.sum() == 0:
-        print(f"   ❌ 未检测到有效物体 (有效物体数: {valid_object_count}, 像素数: {object_mask.sum()})")
-        return []  # 明确返回空列表，触发重新生成
-    
-    # 其余代码保持不变...
-    # 过滤掉深度无效的像素
-    valid_depth_mask = depth > MIN_DEPTH
-    object_mask &= valid_depth_mask
-    
-    print(f"   🎯 有效物体像素: {object_mask.sum()} (深度过滤后)")
-    
-    # ✨ 再次检查：如果过滤后没有有效像素，返回空
-    if object_mask.sum() == 0:
-        print(f"   ❌ 过滤后无有效物体像素")
-        return []
-    
-    # ... 继续原有的候选点生成逻辑
-    obj_coords = np.where(object_mask)
-    if len(obj_coords[0]) == 0:
-        print(f"   ❌ 没有有效的物体坐标")
-        return []
-    
-    print(f"   📍 生成候选点...")
-    
-    # 计算物体中心
-    obj_center_v = int(np.mean(obj_coords[0]))
-    obj_center_u = int(np.mean(obj_coords[1]))
-    
-    print(f"      物体中心: ({obj_center_u}, {obj_center_v})")
-    
-    # 验证中心点的深度
-    center_depth = depth[obj_center_v, obj_center_u]
-    print(f"      中心深度: {center_depth:.3f}m")
-    
-    if center_depth > MIN_DEPTH:
-        # 生成中心点的多个角度候选
-        for theta_idx in range(0, min(4, num_angles)):  # 最多4个角度
-            theta = ANGLE_BINS[theta_idx]
-            candidates.append((obj_center_u, obj_center_v, theta_idx, theta))
-            print(f"      添加中心候选: ({obj_center_u}, {obj_center_v}), 角度={np.degrees(theta):.1f}°")
-    
-    # 添加物体区域的其他点（稀疏采样）
-    step = max(1, len(obj_coords[0]) // 10)  # 最多10个额外点
-    for i in range(0, len(obj_coords[0]), step):
-        v, u = obj_coords[0][i], obj_coords[1][i]
-        if depth[v, u] > MIN_DEPTH:
-            candidates.append((u, v, 0, 0.0))  # 只用0度角
-            if len(candidates) >= 15:  # 限制候选数量
-                break
-    
-    # 只有在有物体候选的情况下才添加少量背景
-    bg_count = 0
-    if len(candidates) > 0:
-        for v in range(0, height, BACKGROUND_STRIDE * 4):
-            for u in range(0, width, BACKGROUND_STRIDE * 4):
-                if not object_mask[v, u] and depth[v, u] > MIN_DEPTH:
-                    candidates.append((u, v, 0, 0.0))
-                    bg_count += 1
-                    if bg_count >= 2:  # 最多2个背景样本
-                        break
-            if bg_count >= 2:
-                break
-    
-    fg_count = len(candidates) - bg_count
-    print(f"   📍 最终采样 {len(candidates)} 个候选 (前景: {fg_count}, 背景: {bg_count})")
-    
-    if fg_count == 0:
-        print(f"   ❌ 警告：没有生成前景候选点！")
-        return []  # 返回空列表，触发重新生成
-    
-    return candidates
-
-
-# ... 其余函数保持不变 ...
-
 def fast_grasp_test(robot_id, world_pos, grasp_angle, object_ids, visualize=False):
     """快速抓取测试 - 增强调试版本"""
     ee_link = 11
@@ -337,16 +187,203 @@ def fast_grasp_test(robot_id, world_pos, grasp_angle, object_ids, visualize=Fals
             except:
                 print(f"            物体{obj_id}: 可能被移除了")
         
-        if not success:
+        # ✨ 新增：释放物体到桌面外围
+        if success:
+            print(f"         📦 释放物体阶段...")
+            
+            # 移动到桌面外围释放位置（避免影响后续抓取）
+            release_pos = [0.3, 0.4, TABLE_TOP_Z + 0.2]  # 桌面边缘，高度20cm
+            print(f"            移动到释放位置: [{release_pos[0]:.3f}, {release_pos[1]:.3f}, {release_pos[2]:.3f}]")
+            
+            # 移动到释放位置
+            if move_fast(robot_id, ee_link, release_pos, ori, steps//2):
+                print(f"            到达释放位置")
+                
+                # 打开夹爪释放物体
+                print(f"            打开夹爪...")
+                open_gripper_fast(robot_id)
+                
+                # 等待物体掉落
+                for _ in range(30):
+                    p.stepSimulation()
+                    time.sleep(1./240.)
+                
+                print(f"         ✅ 物体已释放")
+            else:
+                print(f"         ⚠️  无法到达释放位置，就地释放")
+                # 如果无法到达释放位置，就地打开夹爪
+                open_gripper_fast(robot_id)
+                for _ in range(20):
+                    p.stepSimulation()
+                    time.sleep(1./240.)
+        else:
             print(f"         ❌ 失败：没有物体被抬起")
+            # 即使失败也要打开夹爪，避免夹爪一直闭合
+            print(f"         🔓 打开夹爪...")
+            open_gripper_fast(robot_id)
         
         return success
     
     except Exception as e:
         print(f"         ❌ 异常: {e}")
+        # 异常情况下也要确保夹爪打开
+        try:
+            open_gripper_fast(robot_id)
+        except:
+            pass
         import traceback
         traceback.print_exc()
         return False
+
+def sample_grasp_candidates(depth, num_angles=NUM_ANGLES, visualize=False, rgb=None, view_matrix=None, proj_matrix=None, seg_mask=None, object_ids=None):
+    """基于PyBullet segmentation mask的物体分割策略 - 智能物体选择版"""
+    height, width = depth.shape
+    candidates = []
+    
+    if seg_mask is None or object_ids is None:
+        print(f"   ⚠️  需要segmentation mask和object IDs")
+        return candidates
+    
+    if len(object_ids) == 0:
+        print(f"   ⚠️  物体列表为空，无候选点")
+        return candidates
+    
+    # 分析物体位置和孤立程度
+    object_info = {}
+    valid_objects = []
+    
+    print(f"   🔍 分析物体位置和孤立程度...")
+    for obj_id in object_ids:
+        try:
+            pos, _ = p.getBasePositionAndOrientation(obj_id)
+            
+            # 检查物体是否在合理位置
+            if (pos[2] < TABLE_TOP_Z or pos[2] > TABLE_TOP_Z + 0.3 or
+                abs(pos[0] - 0.6) > 0.4 or abs(pos[1]) > 0.4):
+                print(f"      物体 ID={obj_id}: 位置异常，跳过")
+                continue
+            
+            obj_pixels = (seg_mask == obj_id)
+            pixel_count = obj_pixels.sum()
+            
+            if pixel_count > 10:
+                object_info[obj_id] = {
+                    'pos': pos,
+                    'pixels': pixel_count,
+                    'mask': obj_pixels
+                }
+                valid_objects.append(obj_id)
+                print(f"      物体 ID={obj_id}: {pixel_count} 像素, 位置=[{pos[0]:.3f}, {pos[1]:.3f}, {pos[2]:.3f}]")
+        except:
+            print(f"      物体 ID={obj_id}: 不存在或无法访问")
+            continue
+    
+    # ✨ 关键修复：如果没有有效物体，立即返回空列表
+    if len(valid_objects) == 0:
+        print(f"   ❌ 未检测到有效物体，返回空候选列表")
+        return []  # 明确返回空，触发物体重新生成
+    
+    # 选择最孤立的物体进行抓取
+    if len(valid_objects) == 1:
+        target_object = valid_objects[0]
+        print(f"   🎯 唯一物体 ID={target_object}")
+    else:
+        # 计算每个物体的孤立程度
+        isolation_scores = {}
+        for obj_id in valid_objects:
+            pos = object_info[obj_id]['pos']
+            distances = []
+            
+            for other_id in valid_objects:
+                if other_id == obj_id:
+                    continue
+                other_pos = object_info[other_id]['pos']
+                distance = np.sqrt((pos[0] - other_pos[0])**2 + (pos[1] - other_pos[1])**2)
+                distances.append(distance)
+            
+            min_distance = min(distances)
+            avg_distance = np.mean(distances)
+            isolation_score = 0.7 * min_distance + 0.3 * avg_distance
+            
+            isolation_scores[obj_id] = isolation_score
+            print(f"      物体 ID={obj_id}: 最近距离={min_distance*100:.1f}cm, 孤立度={isolation_score:.3f}")
+        
+        # 选择最孤立的物体
+        target_object = max(isolation_scores.keys(), key=lambda x: isolation_scores[x])
+        print(f"   🎯 选择最孤立物体 ID={target_object} (孤立度: {isolation_scores[target_object]:.3f})")
+    
+    # 专注于目标物体，生成候选点
+    target_mask = object_info[target_object]['mask']
+    target_mask &= (depth > MIN_DEPTH)
+    
+    if target_mask.sum() == 0:
+        print(f"   ❌ 目标物体无有效像素")
+        return []
+    
+    print(f"   🎯 目标物体有效像素: {target_mask.sum()}")
+    
+    # 生成候选点（重用原有的简单逻辑）
+    obj_coords = np.where(target_mask)
+    if len(obj_coords[0]) == 0:
+        print(f"   ❌ 没有有效的物体坐标")
+        return []
+    
+    print(f"   📍 生成候选点...")
+    
+    # 计算物体中心
+    obj_center_v = int(np.mean(obj_coords[0]))
+    obj_center_u = int(np.mean(obj_coords[1]))
+    
+    print(f"      物体中心: ({obj_center_u}, {obj_center_v})")
+    
+    # 验证中心点的深度
+    center_depth = depth[obj_center_v, obj_center_u]
+    print(f"      中心深度: {center_depth:.3f}m")
+    
+    if center_depth > MIN_DEPTH:
+        # 生成中心点的多个角度候选
+        for theta_idx in range(0, min(4, num_angles)):  # 最多4个角度
+            theta = ANGLE_BINS[theta_idx]
+            candidates.append((obj_center_u, obj_center_v, theta_idx, theta))
+            print(f"      添加中心候选: ({obj_center_u}, {obj_center_v}), 角度={np.degrees(theta):.1f}°")
+    
+    # 添加物体区域的其他点（稀疏采样）
+    step = max(1, len(obj_coords[0]) // 10)  # 最多10个额外点
+    for i in range(0, len(obj_coords[0]), step):
+        v, u = obj_coords[0][i], obj_coords[1][i]
+        if depth[v, u] > MIN_DEPTH:
+            candidates.append((u, v, 0, 0.0))  # 只用0度角
+            if len(candidates) >= 15:  # 限制候选数量
+                break
+    
+    # ✨ 修复：只有在真正有目标物体时才添加背景样本
+    # 不要在没有物体时生成背景候选，避免无意义的抓取尝试
+    fg_count = len(candidates)
+    
+    # 只有当前景候选足够多时才添加少量背景
+    if fg_count >= 4:  # 至少4个前景候选才添加背景
+        bg_count = 0
+        for v in range(0, height, BACKGROUND_STRIDE * 4):
+            for u in range(0, width, BACKGROUND_STRIDE * 4):
+                if not target_mask[v, u] and depth[v, u] > MIN_DEPTH:
+                    candidates.append((u, v, 0, 0.0))
+                    bg_count += 1
+                    if bg_count >= 2:  # 最多2个背景样本
+                        break
+            if bg_count >= 2:
+                break
+    else:
+        bg_count = 0
+    
+    print(f"   📍 最终采样 {len(candidates)} 个候选 (前景: {fg_count}, 背景: {bg_count})")
+    
+    # ✨ 严格检查：必须有足够的前景候选
+    if fg_count == 0:
+        print(f"   ❌ 没有生成前景候选点，返回空列表")
+        return []
+    
+    return candidates
+
 
 def move_fast(robot_id, ee_link, target_pos, target_ori, max_steps, slow=False):
     """移动到目标位置"""
@@ -364,6 +401,7 @@ def move_fast(robot_id, ee_link, target_pos, target_ori, max_steps, slow=False):
     )
     
     if not joints or len(joints) < 7:
+        print(f"         ❌ IK求解失败，无法到达位置 [{target_pos[0]:.3f}, {target_pos[1]:.3f}, {target_pos[2]:.3f}]")
         return False
     
     velocity = 0.3 if slow else 1.0
@@ -377,11 +415,18 @@ def move_fast(robot_id, ee_link, target_pos, target_ori, max_steps, slow=False):
     
     for _ in range(max_steps):
         p.stepSimulation()
-        time.sleep(1./240.)
+        if not slow:
+            time.sleep(1./240.)
     
     current = p.getLinkState(robot_id, ee_link)[0]
     dist = np.linalg.norm(np.array(current) - np.array(target_pos))
-    return dist < 0.10
+    
+    if dist < 0.10:
+        print(f"         ✅ 成功到达位置，误差: {dist*100:.1f}cm")
+        return True
+    else:
+        print(f"         ⚠️  位置误差较大: {dist*100:.1f}cm")
+        return dist < 0.15  # 放宽一些容差
 
 
 def close_gripper_slow(robot_id, steps):
@@ -395,17 +440,27 @@ def close_gripper_slow(robot_id, steps):
 
 
 def open_gripper_fast(robot_id):
-    """打开夹爪"""
-    pos = 0.04 / 2.0
-    p.setJointMotorControl2(robot_id, 9, p.POSITION_CONTROL, targetPosition=pos, force=50)
-    p.setJointMotorControl2(robot_id, 10, p.POSITION_CONTROL, targetPosition=pos, force=50)
-    for _ in range(10):
+    """打开夹爪 - 增强版"""
+    pos = 0.04 / 2.0  # 完全打开
+    
+    # 使用更强的力和更快的速度
+    p.setJointMotorControl2(robot_id, 9, p.POSITION_CONTROL, 
+                          targetPosition=pos, force=100, maxVelocity=1.0)
+    p.setJointMotorControl2(robot_id, 10, p.POSITION_CONTROL, 
+                          targetPosition=pos, force=100, maxVelocity=1.0)
+    
+    # 确保夹爪完全打开
+    for _ in range(30):  # 增加步数
         p.stepSimulation()
-
+        time.sleep(1./240.)
 
 def reset_robot_home(robot_id):
     """重置机器人到初始位置"""
     home = [0, -0.785, 0, -2.356, 0, 1.571, 0.785]
+    
+    # ✨ 确保在移动前夹爪是打开的
+    print("   🔓 确保夹爪打开...")
+    open_gripper_fast(robot_id)
     
     # 使用位置控制而不是直接设置关节状态，更平滑
     for i in range(7):
@@ -415,9 +470,6 @@ def reset_robot_home(robot_id):
             force=500, 
             maxVelocity=2.0
         )
-    
-    # 确保夹爪打开
-    open_gripper_fast(robot_id)
     
     # 等待到位
     for _ in range(120):
@@ -433,6 +485,14 @@ def reset_robot_home(robot_id):
         
         if all_in_position:
             break
+    
+    # ✨ 最后再次确保夹爪打开
+    open_gripper_fast(robot_id)
+    print("   🏠 机器人已回到初始位置，夹爪已打开")
+
+
+# ... 保留其他函数（generate_scene_data, save_scene_data 等）
+# 剩余代码保持不变
 
 
 def generate_scene_data(scene_id, num_objects=3, visualize=False):
@@ -494,9 +554,13 @@ def generate_scene_data(scene_id, num_objects=3, visualize=False):
             
             print(f"   📦 物体状态: {old_count} → {new_count}")
             
-            # ✨ 立即检查是否需要重新生成物体（不等待2次）
-            if len(object_ids) == 0:
-                print("   ⚠️  桌面为空，立即重新生成物体...")
+            # ✨ 修复2：如果连续多次没有有效物体，强制清理和重新生成
+            if len(object_ids) == 0 or consecutive_failures >= 3:
+                if consecutive_failures >= 3:
+                    print(f"   ⚠️  连续 {consecutive_failures} 次失败，强制清理并重新生成物体...")
+                else:
+                    print("   ⚠️  桌面为空，立即重新生成物体...")
+                
                 from environment_setup import reset_objects_after_grasp
                 object_ids = reset_objects_after_grasp([], min_objects=num_objects)
                 consecutive_failures = 0
@@ -509,8 +573,8 @@ def generate_scene_data(scene_id, num_objects=3, visualize=False):
                     # 等待物体稳定
                     for _ in range(120):
                         p.stepSimulation()
-                    # 重新开始这个循环迭代
-                    grasp_attempt -= 1  # 不计入这次尝试
+                    # 重新开始这个循环迭代，不计入尝试次数
+                    grasp_attempt -= 1
                     continue
             
             # 拍摄新照片（确保有物体后才拍照）
@@ -532,29 +596,27 @@ def generate_scene_data(scene_id, num_objects=3, visualize=False):
             # 基于当前图像采样候选
             candidates = sample_grasp_candidates(depth, NUM_ANGLES, visualize, rgb, view_matrix, proj_matrix, seg_mask, object_ids)
             
+            # ✨ 修复：如果候选点为空，立即触发重新生成
             if len(candidates) == 0:
                 print("   ⚠️  未找到有效候选点")
                 consecutive_failures += 1
                 
-                # ✨ 更快的重新生成触发（减少到2次失败）
-                if consecutive_failures >= 2:
-                    print("   🔄 连续未找到候选点，重新生成物体...")
-                    from environment_setup import reset_objects_after_grasp
-                    object_ids = reset_objects_after_grasp([], min_objects=num_objects)
-                    consecutive_failures = 0
-                    
-                    if len(object_ids) == 0:
-                        print("   ❌ 无法生成新物体，结束场景")
-                        break
-                    else:
-                        print(f"   ✅ 重新生成 {len(object_ids)} 个物体")
-                        # 等待物体稳定
-                        for _ in range(120):
-                            p.stepSimulation()
-                        # 重新开始循环
-                        grasp_attempt -= 1  # 不计入这次尝试
-                        continue
+                # 立即触发重新生成
+                print("   🔄 立即重新生成物体...")
+                from environment_setup import reset_objects_after_grasp
+                object_ids = reset_objects_after_grasp([], min_objects=num_objects)
+                consecutive_failures = 0
+                
+                if len(object_ids) == 0:
+                    print("   ❌ 无法生成新物体，结束场景")
+                    break
                 else:
+                    print(f"   ✅ 重新生成 {len(object_ids)} 个物体")
+                    # 等待物体稳定
+                    for _ in range(120):
+                        p.stepSimulation()
+                    # 重新开始循环，不计入尝试次数
+                    grasp_attempt -= 1
                     continue
             
             # 重置失败计数器
