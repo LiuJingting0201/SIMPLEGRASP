@@ -5,7 +5,7 @@ import cv2
 
 # Constants from geom.py, to be centralized later if needed
 TABLE_TOP_Z = 0.625  # 与environment_setup.py保持一致
-CAMERA_TARGET = [0.60, 0, TABLE_TOP_Z]  # 对准物体生成中心（更靠前）
+CAMERA_TARGET = [0.60, 0, TABLE_TOP_Z]  # 对准物体生成中心（更靠前）- 与environment_setup.py一致
 CAMERA_DISTANCE = 1.2
 CAMERA_PARAMS = {
     'width': 224,

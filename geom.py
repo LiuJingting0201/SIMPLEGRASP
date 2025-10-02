@@ -4,17 +4,17 @@ import pybullet as p
 
 # ===== 统一的场景几何配置 (修复版本) =====
 TABLE_TOP_Z = 0.625  # PyBullet内置table桌面高度近似值
-ROBOT_BASE_POS = [0, 0, TABLE_TOP_Z - 0.05]  # 机械臂基座位置 (补偿机械臂自身的0.05偏移)
-TABLE_POS = [0.6, 0, 0]         # 桌子位置 (稳定配置)
-OBJECT_SPAWN_HEIGHT = TABLE_TOP_Z + 0.02  # 物体生成高度 (降低一点)
+TABLE_POS = [0.5, 0, 0]         # Table position (table center) - 与environment_setup.py一致
+ROBOT_BASE_POS = [0, 0, TABLE_TOP_Z]  # Robot base mounted on the table surface
+OBJECT_SPAWN_CENTER = [0.60, 0, TABLE_TOP_Z]  # 物体生成中心 - 与environment_setup.py一致
 
 # 工作区域定义 (桌面上的安全抓取区域)
 WORKSPACE_X_RANGE = [0.45, 0.75]  # X方向范围 (调整到桌子周围)
 WORKSPACE_Y_RANGE = [-0.15, 0.15] # Y方向范围
 
 # 相机配置
-CAMERA_TARGET = (TABLE_POS[0], TABLE_POS[1], TABLE_TOP_Z)  # 相机目标点 - 与桌子位置对齐
-CAMERA_DISTANCE = 0.65  # 相机距离
+CAMERA_TARGET = OBJECT_SPAWN_CENTER  # 相机目标点 - 对准物体生成中心，与environment_setup.py一致
+CAMERA_DISTANCE = 1.2  # 相机距离 - 与perception.py一致
 CAMERA_PARAMS = {
     'width': 224,
     'height': 224, 
@@ -68,8 +68,9 @@ def move_ee_via_ik(robot_id, ee_link, pos, orn=None, steps=240):
     if orn is None:
         orn = p.getQuaternionFromEuler([0, np.pi, 0])  # 工具Z朝下
     joints = p.calculateInverseKinematics(robot_id, ee_link, pos, orn, maxNumIterations=200)
-    idxs = list(range(p.getNumJoints(robot_id)))
-    p.setJointMotorControlArray(robot_id, idxs, p.POSITION_CONTROL, targetPositions=joints)
+    # 只控制前7个关节（机械臂关节）
+    idxs = list(range(7))
+    p.setJointMotorControlArray(robot_id, idxs, p.POSITION_CONTROL, targetPositions=joints[:7])
     for _ in range(steps): p.stepSimulation()
 
 def control_gripper(robot_id, open_width=0.08, steps=120):
@@ -99,12 +100,12 @@ def control_gripper(robot_id, open_width=0.08, steps=120):
     
     return actual_width
 
-def setup_scene(add_objects=True, n_objects=2, set_gravity=True):
+def setup_scene(add_objects=True, n_objects=2):
     """统一的场景设置函数，确保所有位置一致。"""
     import pybullet_data
     
-    if set_gravity:
-        p.setGravity(0, 0, -9.8)
+    # 设置重力
+    p.setGravity(0, 0, -9.8)
     
     # 设置PyBullet数据路径
     p.setAdditionalSearchPath(pybullet_data.getDataPath())
@@ -120,27 +121,8 @@ def setup_scene(add_objects=True, n_objects=2, set_gravity=True):
     
     obj_ids = []
     if add_objects:
-        # 在工作区域内生成物体
-        for _ in range(n_objects):
-            x = TABLE_POS[0] + np.random.uniform(-0.15, 0.15)  # 基于桌子位置
-            y = TABLE_POS[1] + np.random.uniform(-0.15, 0.15)  # 基于桌子位置
-            z = OBJECT_SPAWN_HEIGHT
-            
-            # 随机选择物体类型 - 使用小尺寸物体
-            if np.random.rand() > 0.5:
-                obj_id = p.loadURDF("cube_small.urdf", [x, y, z])
-            else:
-                # 使用小球体而不是大球体
-                obj_id = p.loadURDF("sphere_small.urdf", [x, y, z])
-            
-            # 设置物理属性 - 更稳定的设置
-            p.changeDynamics(obj_id, -1, 
-                           lateralFriction=2.0,    # 增加摩擦力
-                           restitution=0.1,        # 降低弹性
-                           linearDamping=0.8,      # 增加线性阻尼
-                           angularDamping=0.8,     # 增加角阻尼
-                           mass=0.1)               # 设置质量
-            obj_ids.append(obj_id)
+        # 使用与environment_setup.py相同的物体创建逻辑
+        obj_ids = create_objects_like_environment_setup(n_objects)
     
     # 让物体稳定下来 - 增加仿真时间
     for _ in range(1000):  # 增加到1000步
@@ -152,3 +134,107 @@ def is_position_in_workspace(x, y):
     """检查位置是否在工作区域内。"""
     return (WORKSPACE_X_RANGE[0] <= x <= WORKSPACE_X_RANGE[1] and 
             WORKSPACE_Y_RANGE[0] <= y <= WORKSPACE_Y_RANGE[1])
+
+def create_objects_like_environment_setup(num_objects=2):
+    """Creates objects using the same logic as environment_setup.py's create_better_objects."""
+    # Franka Panda gripper constraints
+    MAX_GRIPPER_OPENING = 0.08  # 8cm maximum
+    SAFE_OBJECT_WIDTH = 0.035   # 3.5cm - safe size for reliable grasping
+    
+    object_ids = []
+    object_positions = []  # Track positions to maintain distance
+    MIN_OBJECT_DISTANCE = 0.06  # Minimum distance between objects
+    MAX_SPAWN_ATTEMPTS = 20
+    
+    # Limit the number of objects
+    num_objects = min(num_objects, 5)  # Reasonable limit
+    
+    for i in range(num_objects):
+        placed = False
+        attempts = 0
+        current_min_distance = MIN_OBJECT_DISTANCE
+        
+        while not placed and attempts < MAX_SPAWN_ATTEMPTS:
+            attempts += 1
+            
+            # Generate random position in workspace
+            x_pos = OBJECT_SPAWN_CENTER[0] + np.random.uniform(-0.15, 0.15)  # 0.45-0.75m
+            y_pos = OBJECT_SPAWN_CENTER[1] + np.random.uniform(-0.25, 0.25)  # -0.25~0.25m
+            candidate_pos = [x_pos, y_pos]
+            
+            # Check distance to existing objects
+            too_close = False
+            if len(object_positions) > 0:
+                for existing_pos in object_positions:
+                    distance = np.sqrt((candidate_pos[0] - existing_pos[0])**2 + 
+                                     (candidate_pos[1] - existing_pos[1])**2)
+                    if distance < current_min_distance:
+                        too_close = True
+                        break
+            
+            if not too_close:
+                placed = True
+                
+            # Gradually reduce distance requirement if struggling to place
+            elif attempts > MAX_SPAWN_ATTEMPTS // 2:
+                current_min_distance = MIN_OBJECT_DISTANCE * 0.8
+        
+        if placed:
+            object_positions.append(candidate_pos)
+            
+            shape_type = np.random.choice([p.GEOM_BOX, p.GEOM_CYLINDER, p.GEOM_SPHERE])
+            color = [np.random.random(), np.random.random(), np.random.random(), 1]
+            
+            if shape_type == p.GEOM_BOX:
+                half_extents = [
+                    np.random.uniform(0.02, SAFE_OBJECT_WIDTH/2),  # 1.5-1.75cm
+                    np.random.uniform(0.02, SAFE_OBJECT_WIDTH/2),  # 1.5-1.75cm
+                    np.random.uniform(0.02, 0.025)                 # 高度: 1.5-2.5cm
+                ]
+                shape = p.createCollisionShape(p.GEOM_BOX, halfExtents=half_extents)
+                visual_shape = p.createVisualShape(p.GEOM_BOX, halfExtents=half_extents, rgbaColor=color)
+                z_pos = TABLE_TOP_Z + half_extents[2]
+            elif shape_type == p.GEOM_CYLINDER:
+                radius = np.random.uniform(0.008, SAFE_OBJECT_WIDTH/2)  # 0.8-1.75cm
+                height = np.random.uniform(0.02, 0.04)                  # 高度: 2-4cm
+                shape = p.createCollisionShape(p.GEOM_CYLINDER, radius=radius, height=height)
+                visual_shape = p.createVisualShape(p.GEOM_CYLINDER, radius=radius, length=height, rgbaColor=color)
+                z_pos = TABLE_TOP_Z + height / 2
+            else: # p.GEOM_SPHERE
+                radius = np.random.uniform(0.008, SAFE_OBJECT_WIDTH/2)  # 0.8-1.75cm
+                shape = p.createCollisionShape(p.GEOM_SPHERE, radius=radius)
+                visual_shape = p.createVisualShape(p.GEOM_SPHERE, radius=radius, rgbaColor=color)
+                z_pos = TABLE_TOP_Z + radius
+
+            body = p.createMultiBody(
+                baseMass=np.random.uniform(0.05, 0.2),  # 较轻的物体更容易抓取
+                baseCollisionShapeIndex=shape,
+                baseVisualShapeIndex=visual_shape,
+                basePosition=[x_pos, y_pos, z_pos + 0.005],  # Slightly above table
+                baseOrientation=p.getQuaternionFromEuler([0, 0, np.random.uniform(0, 3.14)])
+            )
+            p.changeDynamics(body, -1, lateralFriction=1.5, restitution=0.1)
+            object_ids.append(body)
+            
+        else:
+            print(f"   ⚠️  Could not place object {i+1} after {MAX_SPAWN_ATTEMPTS} attempts")
+    
+    # Fallback: create at least one object if none were placed
+    if len(object_ids) == 0:
+        x_pos = OBJECT_SPAWN_CENTER[0]
+        y_pos = OBJECT_SPAWN_CENTER[1]
+        
+        shape = p.createCollisionShape(p.GEOM_BOX, halfExtents=[0.02, 0.02, 0.02])
+        visual_shape = p.createVisualShape(p.GEOM_BOX, halfExtents=[0.02, 0.02, 0.02], 
+                                         rgbaColor=[1, 0, 0, 1])  # Red fallback object
+        body = p.createMultiBody(
+            baseMass=0.1,
+            baseCollisionShapeIndex=shape,
+            baseVisualShapeIndex=visual_shape,
+            basePosition=[x_pos, y_pos, TABLE_TOP_Z + 0.025]
+        )
+        p.changeDynamics(body, -1, lateralFriction=1.5, restitution=0.1)
+        object_ids.append(body)
+        print(f"   🆘 Created fallback object at center")
+    
+    return object_ids
