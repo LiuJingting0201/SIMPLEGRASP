@@ -105,13 +105,13 @@ def move_fast(robot_id, ee_link, target_pos, target_ori, max_steps, slow=False, 
     # ✨ 修复：根据距离动态调整运动参数
     if move_distance > 0.3:  # 如果距离超过30cm
         velocity = 2.0 if slow else 3.0    # 增加速度
-        force = 500 if slow else 800       # 增加力度  
-        actual_steps = 120 if slow else 80  # 增加步数
+        force = 1500 if slow else 2500     # 大幅增加力度  
+        actual_steps = 300 if slow else 300  # 大幅增加步数确保到达
         print(f"            🚀 远距离移动模式: 速度={velocity}, 力度={force}, 步数={actual_steps}")
     else:
         velocity = 1.0 if slow else 2.0
-        force = 300 if slow else 500
-        actual_steps = 60 if slow else 40
+        force = 600 if slow else 1000
+        actual_steps = 80 if slow else 60
         print(f"            🎯 近距离移动模式: 速度={velocity}, 力度={force}, 步数={actual_steps}")
     
     # ✨ 添加调试模式 - 非常慢的运动用于观察
@@ -456,14 +456,25 @@ def sample_grasp_candidates(depth, num_angles=NUM_ANGLES, visualize=False, rgb=N
                 abs(pos[1]) <= 0.5
             )
             
+            print(f"   🔍 物体 {obj_id} 位置检查: pos=[{pos[0]:.3f}, {pos[1]:.3f}, {pos[2]:.3f}], 距离={dist_from_base:.3f}m, 有效={workspace_valid}")
+            
             if workspace_valid:
                 obj_pixels = (seg_mask == obj_id)
-                if obj_pixels.sum() > 5:
+                pixel_count = obj_pixels.sum()
+                print(f"   📊 物体 {obj_id} 分割像素: {pixel_count}")
+                if pixel_count > 5:
                     valid_objects.append(obj_id)
-        except:
+                    print(f"   ✅ 物体 {obj_id} 有效")
+                else:
+                    print(f"   ❌ 物体 {obj_id} 像素不足 (只有 {pixel_count} 像素)")
+            else:
+                print(f"   ❌ 物体 {obj_id} 超出工作空间")
+        except Exception as e:
+            print(f"   ❌ 物体 {obj_id} 检查失败: {e}")
             continue
     
     if len(valid_objects) == 0:
+        print(f"   ❌ 没有有效的物体")
         return []
     
     # ✨ 修复：为每个有效物体生成随机候选点
@@ -471,11 +482,15 @@ def sample_grasp_candidates(depth, num_angles=NUM_ANGLES, visualize=False, rgb=N
         obj_pixels = (seg_mask == obj_id)
         obj_pixels &= (depth > MIN_DEPTH)
         
+        print(f"   🔍 物体 {obj_id} 像素统计: {obj_pixels.sum()} 像素")
+        
         if obj_pixels.sum() == 0:
+            print(f"   ⚠️  物体 {obj_id} 在分割掩码中没有像素，跳过")
             continue
         
         obj_coords = np.where(obj_pixels)
         if len(obj_coords[0]) == 0:
+            print(f"   ⚠️  物体 {obj_id} 坐标为空，跳过")
             continue
         
         # ✨ 随机选择物体上的点，而不是总是选择中心

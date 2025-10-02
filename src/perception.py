@@ -4,13 +4,8 @@ import numpy as np
 import cv2
 
 # Constants from geom.py, to be centralized later if needed
-<<<<<<< HEAD
 TABLE_TOP_Z = 0.625  # 与environment_setup.py保持一致
 CAMERA_TARGET = [0.60, 0, TABLE_TOP_Z]  # 对准物体生成中心（更靠前）
-=======
-TABLE_TOP_Z = 0.65
-CAMERA_TARGET = [0.5, 0, TABLE_TOP_Z]
->>>>>>> 436b2c4942c01436f9fd1f44d399f94f0dc1e548
 CAMERA_DISTANCE = 1.2
 CAMERA_PARAMS = {
     'width': 224,
@@ -47,7 +42,6 @@ def get_rgb_depth(width, height, view, proj):
     depth = np.asarray(img_arr[3], dtype=np.float32).reshape(height, width)
     return rgb, depth
 
-<<<<<<< HEAD
 def get_rgb_depth_segmentation(width, height, view, proj, flags=p.ER_SEGMENTATION_MASK_OBJECT_AND_LINKINDEX):
     """Captures RGB, depth, and segmentation mask from the simulation.
     
@@ -67,8 +61,6 @@ def get_rgb_depth_segmentation(width, height, view, proj, flags=p.ER_SEGMENTATIO
     seg = np.asarray(img_arr[4], dtype=np.int32).reshape(height, width)
     return rgb, depth, seg
 
-=======
->>>>>>> 436b2c4942c01436f9fd1f44d399f94f0dc1e548
 def find_best_grasp_pixel(rgb, depth):
     """Finds the best pixel to grasp based on depth and color information."""
     height, width = rgb.shape[:2]
@@ -98,7 +90,6 @@ def find_best_grasp_pixel(rgb, depth):
     
     return cx, cy
 
-<<<<<<< HEAD
 def pixel_to_world(u, v, depth_buffer, view_matrix, proj_matrix):
     """
     将像素坐标和深度缓冲区值转换为世界坐标
@@ -146,27 +137,3 @@ def pixel_to_world(u, v, depth_buffer, view_matrix, proj_matrix):
     z_world = camera_height - depth_real
     
     return np.array([x_world, y_world, z_world])
-=======
-def pixel_to_world(u, v, depth_value, view_matrix, proj_matrix):
-    """Converts a pixel coordinate to a world coordinate."""
-    width, height = CAMERA_PARAMS['width'], CAMERA_PARAMS['height']
-    x_ndc = (2.0 * u / width) - 1.0
-    y_ndc = 1.0 - (2.0 * v / height)
-    
-    # The depth value from the depth buffer is in range [0, 1]
-    # We need to convert it to a Z coordinate in clip space
-    z_clip = depth_value * 2.0 - 1.0
-
-    # From clip space to view space
-    proj_matrix_np = np.array(proj_matrix).reshape(4, 4)
-    inv_proj = np.linalg.inv(proj_matrix_np)
-    pos_view = inv_proj @ np.array([x_ndc, y_ndc, z_clip, 1.0])
-    pos_view /= pos_view[3]
-
-    # From view space to world space
-    view_matrix_np = np.array(view_matrix).reshape(4, 4)
-    inv_view = np.linalg.inv(view_matrix_np)
-    pos_world = inv_view @ pos_view
-    
-    return pos_world[:3]
->>>>>>> 436b2c4942c01436f9fd1f44d399f94f0dc1e548
