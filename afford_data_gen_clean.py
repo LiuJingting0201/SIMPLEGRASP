@@ -52,188 +52,281 @@ def create_data_dirs():
     print(f"📁 数据目录: {DATA_DIR.absolute()}")
 
 
+def move_fast(robot_id, ee_link, target_pos, target_ori, max_steps, slow=False):
+    """改进的移动函数 - 增加调试信息"""
+    print(f"            尝试移动到: [{target_pos[0]:.3f}, {target_pos[1]:.3f}, {target_pos[2]:.3f}]")
+    
+    ll, ul, jr, rp = [], [], [], []
+    for i in range(7):
+        info = p.getJointInfo(robot_id, i)
+        ll.append(info[8])
+        ul.append(info[9])
+        jr.append(info[9] - info[8])
+        rp.append(p.getJointState(robot_id, i)[0])
+    
+    # ✨ 增加IK求解调试
+    joints = p.calculateInverseKinematics(
+        robot_id, ee_link, target_pos, target_ori,
+        lowerLimits=ll, upperLimits=ul, jointRanges=jr, restPoses=rp,
+        maxNumIterations=100,  # 增加迭代次数
+        residualThreshold=1e-5
+    )
+    
+    if not joints or len(joints) < 7:
+        print(f"            ❌ IK求解失败")
+        return False
+    
+    # ✨ 检查关节角度是否合理
+    for i in range(7):
+        if joints[i] < ll[i] or joints[i] > ul[i]:
+            print(f"            ❌ 关节{i}角度超限: {joints[i]:.3f} (范围: [{ll[i]:.3f}, {ul[i]:.3f}])")
+            return False
+    
+    print(f"            ✅ IK求解成功")
+    
+    velocity = 0.3 if slow else 1.0
+    force = 300 if slow else 500
+    
+    for i in range(7):
+        p.setJointMotorControl2(
+            robot_id, i, p.POSITION_CONTROL,
+            targetPosition=joints[i], force=force, maxVelocity=velocity
+        )
+    
+    # ✨ 增加运动步数
+    actual_steps = max_steps if slow else max_steps * 2
+    for step in range(actual_steps):
+        p.stepSimulation()
+        if not slow:
+            time.sleep(1./240.)
+        
+        # ✨ 每隔一段时间检查进度
+        if step % (actual_steps // 4) == 0:
+            current = p.getLinkState(robot_id, ee_link)[0]
+            dist = np.linalg.norm(np.array(current) - np.array(target_pos))
+            print(f"            进度 {step}/{actual_steps}: 距离目标 {dist*100:.1f}cm")
+    
+    # ✨ 最终位置检查
+    current = p.getLinkState(robot_id, ee_link)[0]
+    dist = np.linalg.norm(np.array(current) - np.array(target_pos))
+    print(f"            最终位置: [{current[0]:.3f}, {current[1]:.3f}, {current[2]:.3f}]")
+    print(f"            最终误差: {dist*100:.1f}cm")
+    
+    success = dist < 0.15  # 放宽到15cm
+    if success:
+        print(f"            ✅ 移动成功")
+    else:
+        print(f"            ❌ 移动失败，误差过大")
+    
+    return success
+
+
+def close_gripper_slow(robot_id, steps):
+    """慢速闭合夹爪"""
+    pos = GRIPPER_CLOSED / 2.0
+    p.setJointMotorControl2(robot_id, 9, p.POSITION_CONTROL, targetPosition=pos, force=50, maxVelocity=0.05)
+    p.setJointMotorControl2(robot_id, 10, p.POSITION_CONTROL, targetPosition=pos, force=50, maxVelocity=0.05)
+    for _ in range(steps):
+        p.stepSimulation()
+        time.sleep(1./240.)
+
+
+def open_gripper_fast(robot_id):
+    """打开夹爪 - 增强版"""
+    pos = 0.04 / 2.0  # 完全打开
+    
+    # 使用更强的力和更快的速度
+    p.setJointMotorControl2(robot_id, 9, p.POSITION_CONTROL, 
+                          targetPosition=pos, force=100, maxVelocity=1.0)
+    p.setJointMotorControl2(robot_id, 10, p.POSITION_CONTROL, 
+                          targetPosition=pos, force=100, maxVelocity=1.0)
+    
+    # 确保夹爪完全打开
+    for _ in range(20):  # 增加步数
+        p.stepSimulation()
+        time.sleep(1./240.)
+
+def reset_robot_home(robot_id):
+    """重置机器人到初始位置"""
+    home = [0, -0.785, 0, -2.356, 0, 1.571, 0.785]
+    
+    # ✨ 确保在移动前夹爪是打开的
+    print("   🔓 确保夹爪打开...")
+    open_gripper_fast(robot_id)
+    
+    # 使用位置控制而不是直接设置关节状态，更平滑
+    for i in range(7):
+        p.setJointMotorControl2(
+            robot_id, i, p.POSITION_CONTROL,
+            targetPosition=home[i], 
+            force=500, 
+            maxVelocity=2.0
+        )
+    
+    # 等待到位
+    for _ in range(120):
+        p.stepSimulation()
+        
+        # 检查是否到位
+        all_in_position = True
+        for i in range(7):
+            current = p.getJointState(robot_id, i)[0]
+            if abs(current - home[i]) > 0.05:  # 容差3度
+                all_in_position = False
+                break
+        
+        if all_in_position:
+            break
+    
+    # ✨ 最后再次确保夹爪打开
+    open_gripper_fast(robot_id)
+    print("   🏠 机器人已回到初始位置，夹爪已打开")
+
+
+def estimate_object_height(depth, object_mask, percentile=10):
+    """估计物体表面高度
+    
+    使用检测到的物体像素的深度值估计表面高度
+    使用较小百分位数来避免噪声和边缘效应
+    
+    Args:
+        depth: 深度图
+        object_mask: 物体mask
+        percentile: 使用的百分位数（默认10 = 最近的10%像素）
+    
+    Returns:
+        物体表面高度（世界坐标Z值）
+    """
+    obj_depths = depth[object_mask]
+    valid_depths = obj_depths[obj_depths > MIN_DEPTH]
+    
+    if len(valid_depths) == 0:
+        return None
+    
+    # 使用较小百分位数的深度值（最接近相机 = 最高点）
+    surface_depth = np.percentile(valid_depths, percentile)
+    
+    # 深度到世界Z的转换（简化版，假设俯视相机）
+    # 相机高度 = TABLE_TOP_Z + camera_distance
+    # 物体Z = 相机高度 - 深度
+    camera_height = TABLE_TOP_Z + 1.2  # CAMERA_DISTANCE = 1.2
+    object_z = camera_height - surface_depth
+    
+    return object_z
+
 def fast_grasp_test(robot_id, world_pos, grasp_angle, object_ids, visualize=False):
-    """快速抓取测试 - 增强调试版本"""
+    """快速抓取测试 - 增加调试版本"""
     ee_link = 11
     steps = SLOW_STEPS if visualize else FAST_STEPS
     
     print(f"         🎯 开始抓取测试: 位置=[{world_pos[0]:.3f}, {world_pos[1]:.3f}, {world_pos[2]:.3f}], 角度={np.degrees(grasp_angle):.1f}°")
     
-    # 检查Z坐标
+    # ✨ 更详细的位置检查
     if world_pos[2] < TABLE_TOP_Z - 0.05 or world_pos[2] > TABLE_TOP_Z + 0.30:
         print(f"         ❌ Z坐标不合理 ({world_pos[2]:.3f}m), 桌面={TABLE_TOP_Z:.3f}m")
         return False
     
-    # 检查XY工作空间
     dist = np.sqrt(world_pos[0]**2 + world_pos[1]**2)
     if dist < 0.35 or dist > 0.80:
         print(f"         ❌ 超出工作范围 (距离={dist:.3f}m), 范围=[0.35, 0.80]m")
         return False
     
-    print(f"         ✅ 位置检查通过: Z={world_pos[2]:.3f}m, 距离={dist:.3f}m")
+    # ✨ 增加X轴检查
+    if world_pos[0] < 0.3:
+        print(f"         ❌ X坐标太近 ({world_pos[0]:.3f}m), 最小=0.30m")
+        return False
     
-    # 记录初始物体状态
+    # ✨ 增加Y轴检查
+    if abs(world_pos[1]) > 0.4:
+        print(f"         ❌ Y坐标超出范围 ({world_pos[1]:.3f}m), 范围=[-0.40, 0.40]m")
+        return False
+    
+    print(f"         ✅ 位置检查通过")
+    
+    # 记录初始物体位置
     initial_z = {}
-    initial_pos = {}
     for obj_id in object_ids:
         try:
             pos, _ = p.getBasePositionAndOrientation(obj_id)
             initial_z[obj_id] = pos[2]
-            initial_pos[obj_id] = pos
-            print(f"         📦 物体{obj_id}初始位置: [{pos[0]:.3f}, {pos[1]:.3f}, {pos[2]:.3f}]")
         except:
-            print(f"         ❌ 无法获取物体{obj_id}位置")
-            return False
+            continue
     
     try:
+        # ✨ 修复姿态计算
         ori = p.getQuaternionFromEuler([np.pi, 0, grasp_angle])
-        print(f"         🎯 目标姿态: 俯视, 旋转={np.degrees(grasp_angle):.1f}°")
+        print(f"         📐 目标姿态计算完成")
         
-        # 预抓取
-        print(f"         ↑ 预抓取阶段...")
-        pre_pos = [world_pos[0], world_pos[1], world_pos[2] + PRE_GRASP_OFFSET]
-        print(f"            目标: [{pre_pos[0]:.3f}, {pre_pos[1]:.3f}, {pre_pos[2]:.3f}]")
+        # 1. 预抓取 - 更保守的高度
+        pre_height = max(world_pos[2] + PRE_GRASP_OFFSET, TABLE_TOP_Z + 0.15)  # 至少15cm高
+        pre_pos = [world_pos[0], world_pos[1], pre_height]
+        print(f"         ↑ 预抓取阶段: 目标=[{pre_pos[0]:.3f}, {pre_pos[1]:.3f}, {pre_pos[2]:.3f}]")
         
-        if not move_fast(robot_id, ee_link, pre_pos, ori, steps):
-            print(f"         ❌ 预抓取运动失败")
+        if not move_fast(robot_id, ee_link, pre_pos, ori, steps//2):
+            print(f"         ❌ 预抓取失败")
             return False
         
-        # 检查实际到达位置
-        actual_pos = p.getLinkState(robot_id, ee_link)[0]
-        pos_error = np.linalg.norm(np.array(actual_pos) - np.array(pre_pos))
-        print(f"            实际位置: [{actual_pos[0]:.3f}, {actual_pos[1]:.3f}, {actual_pos[2]:.3f}]")
-        print(f"            位置误差: {pos_error*1000:.1f}mm")
+        # 2. 下降 - 更保守的深度
+        grasp_height = max(world_pos[2] + GRASP_OFFSET, TABLE_TOP_Z + 0.02)  # 至少2cm高
+        grasp_pos = [world_pos[0], world_pos[1], grasp_height]
+        print(f"         ↓ 下降阶段: 目标=[{grasp_pos[0]:.3f}, {grasp_pos[1]:.3f}, {grasp_pos[2]:.3f}]")
         
-        # 检查物体是否被推走（预抓取阶段不应该碰到物体）
-        for obj_id in object_ids:
-            try:
-                pos, _ = p.getBasePositionAndOrientation(obj_id)
-                xy_dist = np.sqrt((pos[0]-initial_pos[obj_id][0])**2 + (pos[1]-initial_pos[obj_id][1])**2)
-                z_change = pos[2] - initial_z[obj_id]
-                print(f"            物体{obj_id}移动: XY={xy_dist*100:.1f}cm, Z={z_change*100:.1f}cm")
-                if xy_dist > 0.05:  # 移动超过5cm
-                    print(f"         ❌ 预抓取时物体ID={obj_id}被推走 {xy_dist*100:.1f}cm")
-                    return False
-            except:
-                print(f"         ❌ 物体{obj_id}消失")
-                return False
-        
-        # 下降
-        print(f"         ↓ 下降阶段...")
-        grasp_pos = [world_pos[0], world_pos[1], world_pos[2] + GRASP_OFFSET]
-        print(f"            目标深度: Z={grasp_pos[2]:.3f}m (物体={world_pos[2]:.3f}m, offset={GRASP_OFFSET:+.3f}m)")
-        
-        if not move_fast(robot_id, ee_link, grasp_pos, ori, steps, slow=True):
-            print(f"         ❌ 下降运动失败")
+        if not move_fast(robot_id, ee_link, grasp_pos, ori, steps//2, slow=True):
+            print(f"         ❌ 下降失败")
             return False
         
-        # 检查下降后的实际位置
-        actual_pos = p.getLinkState(robot_id, ee_link)[0]
-        pos_error = np.linalg.norm(np.array(actual_pos) - np.array(grasp_pos))
-        print(f"            实际位置: [{actual_pos[0]:.3f}, {actual_pos[1]:.3f}, {actual_pos[2]:.3f}]")
-        print(f"            位置误差: {pos_error*1000:.1f}mm")
-        
-        # 检查物体状态
-        for obj_id in object_ids:
-            try:
-                pos, _ = p.getBasePositionAndOrientation(obj_id)
-                xy_dist = np.sqrt((pos[0]-initial_pos[obj_id][0])**2 + (pos[1]-initial_pos[obj_id][1])**2)
-                z_change = pos[2] - initial_z[obj_id]
-                print(f"            物体{obj_id}移动: XY={xy_dist*100:.1f}cm, Z={z_change*100:.1f}cm")
-                if xy_dist > 0.05:
-                    print(f"         ❌ 下降时物体ID={obj_id}被推走 {xy_dist*100:.1f}cm")
-                    return False
-            except:
-                print(f"         ❌ 物体{obj_id}消失")
-                return False
-        
-        # 闭合夹爪
+        # 3. 闭合夹爪
         print(f"         🤏 闭合夹爪...")
-        close_gripper_slow(robot_id, steps//2)
+        close_gripper_slow(robot_id, steps//3)
         
         # 检查夹爪状态
         finger_state = p.getJointState(robot_id, 9)[0]
-        finger_force = p.getJointState(robot_id, 9)[3]  # 获取力矩
-        print(f"            夹爪状态: 位置={finger_state:.4f}, 力矩={finger_force:.2f}")
-        print(f"            判断: {'有物体' if finger_state > 0.001 else '无物体'}")
+        print(f"         📏 夹爪状态: {finger_state:.4f}")
         
-        if finger_state < 0.001:
-            print(f"         ❌ 夹爪未闭合（物体太小或位置不对）")
+        # 4. 抬起
+        lift_height = grasp_height + 0.15  # 减少抬起高度
+        lift_pos = [grasp_pos[0], grasp_pos[1], lift_height]
+        print(f"         ↑ 抬起阶段: 目标=[{lift_pos[0]:.3f}, {lift_pos[1]:.3f}, {lift_pos[2]:.3f}]")
+        
+        if not move_fast(robot_id, ee_link, lift_pos, ori, steps//2):
+            print(f"         ❌ 抬起失败")
             return False
         
-        # 抬起
-        print(f"         ↑↑ 抬起阶段...")
-        lift_pos = [grasp_pos[0], grasp_pos[1], world_pos[2] + LIFT_HEIGHT]
-        print(f"            目标高度: Z={lift_pos[2]:.3f}m")
-        
-        if not move_fast(robot_id, ee_link, lift_pos, ori, steps):
-            print(f"         ❌ 抬起运动失败")
-            return False
-        
-        # 检查抬起后的位置
-        actual_pos = p.getLinkState(robot_id, ee_link)[0]
-        print(f"            实际位置: [{actual_pos[0]:.3f}, {actual_pos[1]:.3f}, {actual_pos[2]:.3f}]")
-        
-        # 判断成功
+        # 5. 检查成功
         success = False
+        print(f"         🔍 检查抓取结果...")
         for obj_id in object_ids:
             try:
                 pos, _ = p.getBasePositionAndOrientation(obj_id)
-                lift_height = pos[2] - initial_z[obj_id]
-                print(f"            物体{obj_id}: 当前Z={pos[2]:.3f}m, 抬起={lift_height*100:.1f}cm")
-                if lift_height > 0.08:
-                    print(f"         ✅ 成功！物体{obj_id}抬起 {lift_height*100:.1f}cm")
-                    success = True
+                if obj_id in initial_z:
+                    lift_height = pos[2] - initial_z[obj_id]
+                    print(f"         📦 物体{obj_id}: 抬起={lift_height*100:.1f}cm")
+                    if lift_height > 0.06:  # 降低到6cm
+                        success = True
+                        print(f"         ✅ 抓取成功！物体{obj_id}抬起 {lift_height*100:.1f}cm")
+                        break
             except:
-                print(f"            物体{obj_id}: 可能被移除了")
+                continue
         
-        # ✨ 新增：释放物体到桌面外围
-        if success:
-            print(f"         📦 释放物体阶段...")
-            
-            # 移动到桌面外围释放位置（避免影响后续抓取）
-            release_pos = [0.3, 0.4, TABLE_TOP_Z + 0.2]  # 桌面边缘，高度20cm
-            print(f"            移动到释放位置: [{release_pos[0]:.3f}, {release_pos[1]:.3f}, {release_pos[2]:.3f}]")
-            
-            # 移动到释放位置
-            if move_fast(robot_id, ee_link, release_pos, ori, steps//2):
-                print(f"            到达释放位置")
-                
-                # 打开夹爪释放物体
-                print(f"            打开夹爪...")
-                open_gripper_fast(robot_id)
-                
-                # 等待物体掉落
-                for _ in range(30):
-                    p.stepSimulation()
-                    time.sleep(1./240.)
-                
-                print(f"         ✅ 物体已释放")
-            else:
-                print(f"         ⚠️  无法到达释放位置，就地释放")
-                # 如果无法到达释放位置，就地打开夹爪
-                open_gripper_fast(robot_id)
-                for _ in range(20):
-                    p.stepSimulation()
-                    time.sleep(1./240.)
-        else:
-            print(f"         ❌ 失败：没有物体被抬起")
-            # 即使失败也要打开夹爪，避免夹爪一直闭合
-            print(f"         🔓 打开夹爪...")
-            open_gripper_fast(robot_id)
+        # 6. 释放
+        print(f"         🔓 释放物体...")
+        open_gripper_fast(robot_id)
+        
+        # 等待物体掉落
+        for _ in range(20):
+            p.stepSimulation()
+            time.sleep(1./240.)
         
         return success
-    
+        
     except Exception as e:
         print(f"         ❌ 异常: {e}")
-        # 异常情况下也要确保夹爪打开
         try:
             open_gripper_fast(robot_id)
         except:
             pass
-        import traceback
-        traceback.print_exc()
         return False
+
 
 def sample_grasp_candidates(depth, num_angles=NUM_ANGLES, visualize=False, rgb=None, view_matrix=None, proj_matrix=None, seg_mask=None, object_ids=None):
     """基于PyBullet segmentation mask的物体分割策略 - 智能物体选择版"""
@@ -248,20 +341,51 @@ def sample_grasp_candidates(depth, num_angles=NUM_ANGLES, visualize=False, rgb=N
         print(f"   ⚠️  物体列表为空，无候选点")
         return candidates
     
-    # 分析物体位置和孤立程度
-    object_info = {}
-    valid_objects = []
+    # ✨ 关键修复：预先过滤工作空间外的物体
+    print("   🔍 预检查物体工作空间...")
+    workspace_valid_objects = []
     
-    print(f"   🔍 分析物体位置和孤立程度...")
     for obj_id in object_ids:
         try:
             pos, _ = p.getBasePositionAndOrientation(obj_id)
             
-            # 检查物体是否在合理位置
-            if (pos[2] < TABLE_TOP_Z or pos[2] > TABLE_TOP_Z + 0.3 or
-                abs(pos[0] - 0.6) > 0.4 or abs(pos[1]) > 0.4):
-                print(f"      物体 ID={obj_id}: 位置异常，跳过")
-                continue
+            # ✨ 严格的工作空间检查 - 与fast_grasp_test一致
+            dist_from_base = np.sqrt(pos[0]**2 + pos[1]**2)
+            
+            workspace_valid = (
+                pos[2] >= TABLE_TOP_Z and pos[2] <= TABLE_TOP_Z + 0.3 and  # 在桌面上方
+                dist_from_base >= 0.35 and dist_from_base <= 0.80 and     # 距离基座合理
+                pos[0] >= 0.3 and                                          # X轴不要太近
+                abs(pos[1]) <= 0.4                                         # Y轴范围
+            )
+            
+            if workspace_valid:
+                workspace_valid_objects.append(obj_id)
+                print(f"      ✅ 物体 ID={obj_id}: 工作空间内 [{pos[0]:.3f}, {pos[1]:.3f}, {pos[2]:.3f}]")
+            else:
+                print(f"      ❌ 物体 ID={obj_id}: 工作空间外 [{pos[0]:.3f}, {pos[1]:.3f}, {pos[2]:.3f}] - 距离={dist_from_base:.3f}m")
+                
+        except:
+            print(f"      ❌ 物体 ID={obj_id}: 无法访问")
+            continue
+    
+    # ✨ 如果没有工作空间内的物体，立即返回空列表触发清理
+    if len(workspace_valid_objects) == 0:
+        print(f"   ❌ 无工作空间内物体，返回空列表触发清理")
+        return []
+    
+    # 只对工作空间内的物体进行后续处理
+    object_ids = workspace_valid_objects
+    print(f"   📦 工作空间内有效物体: {len(object_ids)} 个")
+
+    # 分析物体位置和孤立程度 - 使用过滤后的物体列表
+    object_info = {}
+    valid_objects = []
+    
+    print(f"   🔍 分析物体像素和孤立程度...")
+    for obj_id in object_ids:
+        try:
+            pos, _ = p.getBasePositionAndOrientation(obj_id)
             
             obj_pixels = (seg_mask == obj_id)
             pixel_count = obj_pixels.sum()
@@ -274,14 +398,16 @@ def sample_grasp_candidates(depth, num_angles=NUM_ANGLES, visualize=False, rgb=N
                 }
                 valid_objects.append(obj_id)
                 print(f"      物体 ID={obj_id}: {pixel_count} 像素, 位置=[{pos[0]:.3f}, {pos[1]:.3f}, {pos[2]:.3f}]")
+            else:
+                print(f"      物体 ID={obj_id}: 像素太少({pixel_count})，跳过")
         except:
             print(f"      物体 ID={obj_id}: 不存在或无法访问")
             continue
     
-    # ✨ 关键修复：如果没有有效物体，立即返回空列表
+    # ✨ 如果过滤后没有有效物体，返回空列表
     if len(valid_objects) == 0:
-        print(f"   ❌ 未检测到有效物体，返回空候选列表")
-        return []  # 明确返回空，触发物体重新生成
+        print(f"   ❌ 未检测到有效像素物体，返回空候选列表")
+        return []
     
     # 选择最孤立的物体进行抓取
     if len(valid_objects) == 1:
@@ -357,7 +483,6 @@ def sample_grasp_candidates(depth, num_angles=NUM_ANGLES, visualize=False, rgb=N
                 break
     
     # ✨ 修复：只有在真正有目标物体时才添加背景样本
-    # 不要在没有物体时生成背景候选，避免无意义的抓取尝试
     fg_count = len(candidates)
     
     # 只有当前景候选足够多时才添加少量背景
@@ -383,116 +508,6 @@ def sample_grasp_candidates(depth, num_angles=NUM_ANGLES, visualize=False, rgb=N
         return []
     
     return candidates
-
-
-def move_fast(robot_id, ee_link, target_pos, target_ori, max_steps, slow=False):
-    """移动到目标位置"""
-    ll, ul, jr, rp = [], [], [], []
-    for i in range(7):
-        info = p.getJointInfo(robot_id, i)
-        ll.append(info[8])
-        ul.append(info[9])
-        jr.append(info[9] - info[8])
-        rp.append(p.getJointState(robot_id, i)[0])
-    
-    joints = p.calculateInverseKinematics(
-        robot_id, ee_link, target_pos, target_ori,
-        lowerLimits=ll, upperLimits=ul, jointRanges=jr, restPoses=rp
-    )
-    
-    if not joints or len(joints) < 7:
-        print(f"         ❌ IK求解失败，无法到达位置 [{target_pos[0]:.3f}, {target_pos[1]:.3f}, {target_pos[2]:.3f}]")
-        return False
-    
-    velocity = 0.3 if slow else 1.0
-    force = 300 if slow else 500
-    
-    for i in range(7):
-        p.setJointMotorControl2(
-            robot_id, i, p.POSITION_CONTROL,
-            targetPosition=joints[i], force=force, maxVelocity=velocity
-        )
-    
-    for _ in range(max_steps):
-        p.stepSimulation()
-        if not slow:
-            time.sleep(1./240.)
-    
-    current = p.getLinkState(robot_id, ee_link)[0]
-    dist = np.linalg.norm(np.array(current) - np.array(target_pos))
-    
-    if dist < 0.10:
-        print(f"         ✅ 成功到达位置，误差: {dist*100:.1f}cm")
-        return True
-    else:
-        print(f"         ⚠️  位置误差较大: {dist*100:.1f}cm")
-        return dist < 0.15  # 放宽一些容差
-
-
-def close_gripper_slow(robot_id, steps):
-    """慢速闭合夹爪"""
-    pos = GRIPPER_CLOSED / 2.0
-    p.setJointMotorControl2(robot_id, 9, p.POSITION_CONTROL, targetPosition=pos, force=50, maxVelocity=0.05)
-    p.setJointMotorControl2(robot_id, 10, p.POSITION_CONTROL, targetPosition=pos, force=50, maxVelocity=0.05)
-    for _ in range(steps):
-        p.stepSimulation()
-        time.sleep(1./240.)
-
-
-def open_gripper_fast(robot_id):
-    """打开夹爪 - 增强版"""
-    pos = 0.04 / 2.0  # 完全打开
-    
-    # 使用更强的力和更快的速度
-    p.setJointMotorControl2(robot_id, 9, p.POSITION_CONTROL, 
-                          targetPosition=pos, force=100, maxVelocity=1.0)
-    p.setJointMotorControl2(robot_id, 10, p.POSITION_CONTROL, 
-                          targetPosition=pos, force=100, maxVelocity=1.0)
-    
-    # 确保夹爪完全打开
-    for _ in range(30):  # 增加步数
-        p.stepSimulation()
-        time.sleep(1./240.)
-
-def reset_robot_home(robot_id):
-    """重置机器人到初始位置"""
-    home = [0, -0.785, 0, -2.356, 0, 1.571, 0.785]
-    
-    # ✨ 确保在移动前夹爪是打开的
-    print("   🔓 确保夹爪打开...")
-    open_gripper_fast(robot_id)
-    
-    # 使用位置控制而不是直接设置关节状态，更平滑
-    for i in range(7):
-        p.setJointMotorControl2(
-            robot_id, i, p.POSITION_CONTROL,
-            targetPosition=home[i], 
-            force=500, 
-            maxVelocity=2.0
-        )
-    
-    # 等待到位
-    for _ in range(120):
-        p.stepSimulation()
-        
-        # 检查是否到位
-        all_in_position = True
-        for i in range(7):
-            current = p.getJointState(robot_id, i)[0]
-            if abs(current - home[i]) > 0.05:  # 容差3度
-                all_in_position = False
-                break
-        
-        if all_in_position:
-            break
-    
-    # ✨ 最后再次确保夹爪打开
-    open_gripper_fast(robot_id)
-    print("   🏠 机器人已回到初始位置，夹爪已打开")
-
-
-# ... 保留其他函数（generate_scene_data, save_scene_data 等）
-# 剩余代码保持不变
 
 
 def generate_scene_data(scene_id, num_objects=3, visualize=False):
@@ -763,35 +778,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
-
-def estimate_object_height(depth, object_mask, percentile=10):
-    """估计物体表面高度
-    
-    使用检测到的物体像素的深度值估计表面高度
-    使用较小百分位数来避免噪声和边缘效应
-    
-    Args:
-        depth: 深度图
-        object_mask: 物体mask
-        percentile: 使用的百分位数（默认10 = 最近的10%像素）
-    
-    Returns:
-        物体表面高度（世界坐标Z值）
-    """
-    obj_depths = depth[object_mask]
-    valid_depths = obj_depths[obj_depths > MIN_DEPTH]
-    
-    if len(valid_depths) == 0:
-        return None
-    
-    # 使用较小百分位数的深度值（最接近相机 = 最高点）
-    surface_depth = np.percentile(valid_depths, percentile)
-    
-    # 深度到世界Z的转换（简化版，假设俯视相机）
-    # 相机高度 = TABLE_TOP_Z + camera_distance
-    # 物体Z = 相机高度 - 深度
-    camera_height = TABLE_TOP_Z + 1.2  # CAMERA_DISTANCE = 1.2
-    object_z = camera_height - surface_depth
-    
-    return object_z
