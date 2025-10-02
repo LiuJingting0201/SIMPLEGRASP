@@ -40,7 +40,7 @@ EDGE_MARGIN = 20  # 从图像边缘采样桌子颜色的边距（像素）
 # 抓取参数
 TABLE_TOP_Z = 0.625
 PRE_GRASP_OFFSET = 0.12  # 预抓取高度（从物体顶部）
-GRASP_OFFSET = -0.005    # 抓取高度：物体顶部下方5mm（进入物体以抓取）
+GRASP_OFFSET = -0.01    # 抓取高度：物体顶部下方5mm（进入物体以抓取）
 POST_GRASP_OFFSET = 0.00
 LIFT_HEIGHT = 0.30
 GRIPPER_CLOSED = 0.00
@@ -55,19 +55,7 @@ def create_data_dirs():
 
 
 def sample_grasp_candidates(depth, num_angles=NUM_ANGLES, visualize=False, rgb=None, view_matrix=None, proj_matrix=None, seg_mask=None, object_ids=None):
-    """基于PyBullet segmentation mask的物体分割策略
-    
-    使用相机的内置分割功能直接识别物体像素
-    
-    Args:
-        depth: 深度图
-        num_angles: 角度数量  
-        visualize: 是否可视化
-        rgb: RGB图像
-        view_matrix, proj_matrix: 相机矩阵（用于调试坐标转换）
-        seg_mask: PyBullet segmentation mask
-        object_ids: 物体ID列表
-    """
+    """基于PyBullet segmentation mask的物体分割策略"""
     height, width = depth.shape
     candidates = []
     
@@ -75,22 +63,42 @@ def sample_grasp_candidates(depth, num_angles=NUM_ANGLES, visualize=False, rgb=N
         print(f"   ⚠️  需要segmentation mask和object IDs")
         return candidates
     
+    # ✨ 关键修复：首先检查是否真的有物体存在
+    if len(object_ids) == 0:
+        print(f"   ⚠️  物体列表为空，无候选点")
+        return candidates
+    
     # Step 1: 使用PyBullet segmentation mask直接获取物体像素  
     object_mask = np.zeros((height, width), dtype=bool)
+    valid_object_count = 0
+    
     for obj_id in object_ids:
-        object_mask |= (seg_mask == obj_id)
+        try:
+            # 验证物体是否真的存在于场景中
+            pos, _ = p.getBasePositionAndOrientation(obj_id)
+            obj_pixels = (seg_mask == obj_id)
+            if obj_pixels.sum() > 0:  # 只有在相机中可见的物体才计算
+                object_mask |= obj_pixels
+                valid_object_count += 1
+                if visualize:
+                    print(f"      物体 ID={obj_id}: {obj_pixels.sum()} 像素, 位置=[{pos[0]:.3f}, {pos[1]:.3f}, {pos[2]:.3f}]")
+        except:
+            # 物体不存在
+            if visualize:
+                print(f"      物体 ID={obj_id}: 不存在")
+            continue
+    
+    # ✨ 关键修复：如果没有有效物体像素，返回空列表
+    if valid_object_count == 0 or object_mask.sum() == 0:
+        print(f"   ⚠️  未检测到有效物体 (有效物体数: {valid_object_count}, 像素数: {object_mask.sum()})")
+        return candidates
     
     # 过滤掉深度无效的像素
     object_mask &= (depth > MIN_DEPTH)
     
     if visualize:
-        print(f"   � Segmentation检测: {object_mask.sum()} 像素 ({100*object_mask.sum()/(height*width):.1f}%)")
-        print(f"   � 物体IDs: {object_ids}")
-        
-        # 显示每个物体的像素数
-        for obj_id in object_ids:
-            obj_pixels = (seg_mask == obj_id).sum()
-            print(f"      物体 ID={obj_id}: {obj_pixels} 像素")
+        print(f"   🎯 Segmentation检测: {object_mask.sum()} 像素 ({100*object_mask.sum()/(height*width):.1f}%)")
+        print(f"   🎯 有效物体数: {valid_object_count}")
         
         # 显示物体深度统计
         if object_mask.sum() > 0:
@@ -98,66 +106,10 @@ def sample_grasp_candidates(depth, num_angles=NUM_ANGLES, visualize=False, rgb=N
             valid_obj_depths = obj_depths[obj_depths > MIN_DEPTH]
             if len(valid_obj_depths) > 0:
                 print(f"   📊 物体深度: min={valid_obj_depths.min():.3f}m, max={valid_obj_depths.max():.3f}m, mean={valid_obj_depths.mean():.3f}m")
-        
-        # 保存可视化
-        vis = np.zeros((height, width, 3), dtype=np.uint8)
-        
-        # 为每个物体分配不同的颜色
-        colors = [(255, 0, 0), (0, 255, 0), (0, 0, 255), (255, 255, 0), (255, 0, 255), (0, 255, 255)]
-        for idx, obj_id in enumerate(object_ids):
-            obj_pixels = (seg_mask == obj_id)
-            vis[obj_pixels] = colors[idx % len(colors)]
-        
-        # 标记图像中心
-        center_v, center_u = height // 2, width // 2
-        cv2.circle(vis, (center_u, center_v), 5, (255, 255, 255), -1)  # 白色=图像中心
-        
-        cv2.imwrite("/tmp/object_detection.png", vis)
-        
-        # 保存深度热图
-        valid_depth = depth[depth > MIN_DEPTH]
-        if len(valid_depth) > 0:
-            depth_min, depth_max = valid_depth.min(), valid_depth.max()
-            depth_vis = np.clip((depth - depth_min) / (depth_max - depth_min + 1e-6) * 255, 0, 255).astype(np.uint8)
-            depth_color = cv2.applyColorMap(depth_vis, cv2.COLORMAP_JET)
-            depth_color[depth <= MIN_DEPTH] = [0, 0, 0]
-            cv2.imwrite("/tmp/depth_heatmap.png", depth_color)
-        
-        # 保存segmentation mask可视化
-        seg_vis = ((seg_mask % 10) * 25).astype(np.uint8)
-        cv2.imwrite("/tmp/segmentation_mask.png", seg_vis)
-        
-        # 保存RGB图像
-        if rgb is not None:
-            cv2.imwrite("/tmp/rgb_image.png", cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR))
-        
-        print(f"   💾 可视化已保存:")
-        print(f"      /tmp/object_detection.png (绿色=检测到的物体, 黄色=深度候选)")
-        print(f"      /tmp/depth_heatmap.png (深度热图, 蓝色=近, 红色=远)")
-        print(f"      /tmp/rgb_image.png (原始RGB图)")
-        
-        # 显示检测到的物体区域的位置
-        if object_mask.sum() > 0:
-            obj_coords = np.where(object_mask)
-            obj_center_v = int(np.mean(obj_coords[0]))
-            obj_center_u = int(np.mean(obj_coords[1]))
-            print(f"   📍 检测到的物体中心像素: ({obj_center_u}, {obj_center_v})")
-            print(f"   📍 图像中心像素: ({center_u}, {center_v})")
-            
-            # 显示物体区域的深度样本
-            sample_v, sample_u = obj_coords[0][0], obj_coords[1][0]
-            sample_depth = depth[sample_v, sample_u]
-            sample_rgb = rgb[sample_v, sample_u]
-            print(f"   🔍 物体区域样本像素 ({sample_u}, {sample_v}):")
-            print(f"      深度={sample_depth:.3f}m, RGB={sample_rgb}")
-            
-            # 测试像素到世界坐标的转换
-            if view_matrix is not None and proj_matrix is not None:
-                test_world = pixel_to_world(obj_center_u, obj_center_v, depth[obj_center_v, obj_center_u], view_matrix, proj_matrix)
-                print(f"   🧭 物体中心像素 → 世界坐标: [{test_world[0]:.3f}, {test_world[1]:.3f}, {test_world[2]:.3f}]")
     
+    # ✨ 再次检查：如果过滤后没有有效像素，返回空
     if object_mask.sum() == 0:
-        print(f"   ⚠️  未检测到物体")
+        print(f"   ⚠️  过滤后无有效物体像素")
         return candidates
     
     print(f"   🎯 检测到物体像素: {object_mask.sum()}")
@@ -227,17 +179,26 @@ def sample_grasp_candidates(depth, num_angles=NUM_ANGLES, visualize=False, rgb=N
                     for u, v in edge_pos:
                         candidates.append((u, v, theta_idx, theta))
     
-    # 背景采样（减少背景样本数量，重点测试物体）
-    bg_count = 0
-    bg_stride = BACKGROUND_STRIDE * 2  # 更稀疏的背景采样
-    for v in range(0, height, bg_stride):
-        for u in range(0, width, bg_stride):
-            if not object_mask[v, u] and depth[v, u] > MIN_DEPTH:
-                candidates.append((u, v, 0, 0.0))
-                bg_count += 1
-    
-    fg_count = len(candidates) - bg_count
-    print(f"   📍 采样 {len(candidates)} 个候选 (前景: {fg_count}, 背景: {bg_count})")
+    # ✨ 关键修复：只有当有物体时才添加少量背景样本
+    if len(candidates) > 0:
+        # 背景采样（减少背景样本数量，重点测试物体）
+        bg_count = 0
+        bg_stride = BACKGROUND_STRIDE * 2  # 更稀疏的背景采样
+        max_bg_samples = 5  # 最多5个背景样本
+        for v in range(0, height, bg_stride):
+            for u in range(0, width, bg_stride):
+                if not object_mask[v, u] and depth[v, u] > MIN_DEPTH:
+                    candidates.append((u, v, 0, 0.0))
+                    bg_count += 1
+                    if bg_count >= max_bg_samples:
+                        break
+            if bg_count >= max_bg_samples:
+                break
+        
+        fg_count = len(candidates) - bg_count
+        print(f"   📍 采样 {len(candidates)} 个候选 (前景: {fg_count}, 背景: {bg_count})")
+    else:
+        print(f"   ⚠️  无法生成候选点，物体区域为空")
     
     if visualize and len(candidates) > 100:
         # 在可视化模式下，优先测试前景候选
@@ -409,11 +370,35 @@ def open_gripper_fast(robot_id):
 
 
 def reset_robot_home(robot_id):
-    """重置机器人"""
+    """重置机器人到初始位置"""
     home = [0, -0.785, 0, -2.356, 0, 1.571, 0.785]
+    
+    # 使用位置控制而不是直接设置关节状态，更平滑
     for i in range(7):
-        p.resetJointState(robot_id, i, home[i])
+        p.setJointMotorControl2(
+            robot_id, i, p.POSITION_CONTROL,
+            targetPosition=home[i], 
+            force=500, 
+            maxVelocity=2.0
+        )
+    
+    # 确保夹爪打开
     open_gripper_fast(robot_id)
+    
+    # 等待到位
+    for _ in range(120):
+        p.stepSimulation()
+        
+        # 检查是否到位
+        all_in_position = True
+        for i in range(7):
+            current = p.getJointState(robot_id, i)[0]
+            if abs(current - home[i]) > 0.05:  # 容差3度
+                all_in_position = False
+                break
+        
+        if all_in_position:
+            break
 
 
 def generate_scene_data(scene_id, num_objects=3, visualize=False):
@@ -433,34 +418,117 @@ def generate_scene_data(scene_id, num_objects=3, visualize=False):
         for _ in range(120):
             p.stepSimulation()
         
+        # 确保机器人在初始位置
+        reset_robot_home(robot_id)
+        for _ in range(60):
+            p.stepSimulation()
+        
         if visualize:
             print("   ⏸️  按 Enter 继续...")
             input()
         
-        print("   📸 采集图像")
-        width, height, view_matrix, proj_matrix = set_topdown_camera()
-        rgb, depth, seg_mask = get_rgb_depth_segmentation(width, height, view_matrix, proj_matrix)
+        # 主循环：持续抓取直到没有物体
+        total_samples = 0
+        total_success = 0
+        grasp_attempt = 0
+        consecutive_failures = 0  # 连续失败计数器
         
-        if visualize:
-            for i, obj_id in enumerate(object_ids):
-                pos, _ = p.getBasePositionAndOrientation(obj_id)
-                print(f"   📦 物体{i+1} (ID={obj_id}): [{pos[0]:.3f}, {pos[1]:.3f}, {pos[2]:.3f}]")
-            print(f"   📊 深度: min={depth.min():.3f}, max={depth.max():.3f}")
-            print(f"   🎭 Segmentation mask: {len(np.unique(seg_mask))} 个不同ID")
+        # 用于保存最终数据的变量
+        final_rgb = None
+        final_depth = None
+        final_label = None
         
-        candidates = sample_grasp_candidates(depth, NUM_ANGLES, visualize, rgb, view_matrix, proj_matrix, seg_mask, object_ids)
-        
-        label = np.zeros((height, width, NUM_ANGLES + 1), dtype=np.uint8)
-        
-        print(f"   🧪 测试 {len(candidates)} 个候选")
-        success_count = 0
-        
-        for idx, (u, v, theta_idx, theta) in enumerate(candidates):
-            if depth[v, u] < MIN_DEPTH:
-                continue
+        while grasp_attempt < 50:  # 最多50次抓取尝试
+            grasp_attempt += 1
+            
+            # ✨ 关键修复：每次抓取尝试前都更新相机！
+            print(f"\n   📸 更新相机图像 (尝试 {grasp_attempt}, 剩余物体: {len(object_ids)})")
+            
+            # 确保机器人在家位置
+            print("   🏠 确保机器人回到初始位置...")
+            reset_robot_home(robot_id)
+            
+            # 等待机器人完全稳定
+            for _ in range(120):
+                p.stepSimulation()
+            
+            # 验证机器人位置
+            if visualize:
+                home_joints = [0, -0.785, 0, -2.356, 0, 1.571, 0.785]
+                current_joints = []
+                for i in range(7):
+                    current_joints.append(p.getJointState(robot_id, i)[0])
+                
+                joint_errors = [abs(current_joints[i] - home_joints[i]) for i in range(7)]
+                max_error = max(joint_errors)
+                print(f"   🎯 关节误差: 最大 {max_error:.4f} rad")
+                
+                if max_error > 0.1:
+                    print(f"   ⚠️  机器人未完全归位，重试...")
+                    reset_robot_home(robot_id)
+                    for _ in range(180):
+                        p.stepSimulation()
+            
+            # 拍摄新照片 - 反映当前场景状态
+            width, height, view_matrix, proj_matrix = set_topdown_camera()
+            rgb, depth, seg_mask = get_rgb_depth_segmentation(width, height, view_matrix, proj_matrix)
+            
+            # 保存当前图像
+            final_rgb = rgb.copy()
+            final_depth = depth.copy()
+            
+            # 更新活跃物体列表 - 关键修复！
+            from environment_setup import update_object_states
+            object_ids = update_object_states(object_ids)
+            
+            # ✨ 关键修复：检查是否还有物体
+            if len(object_ids) == 0:
+                print("   ✅ 所有物体已被移除，场景完成！")
+                break
             
             if visualize:
-                print(f"\n      === 候选 {idx+1}/{len(candidates)} ===")
+                for i, obj_id in enumerate(object_ids):
+                    try:
+                        pos, _ = p.getBasePositionAndOrientation(obj_id)
+                        print(f"   📦 物体{i+1} (ID={obj_id}): [{pos[0]:.3f}, {pos[1]:.3f}, {pos[2]:.3f}]")
+                    except:
+                        print(f"   ❌ 物体{i+1} (ID={obj_id}): 已不存在")
+            
+                        # 基于当前图像采样候选
+            candidates = sample_grasp_candidates(depth, NUM_ANGLES, visualize, rgb, view_matrix, proj_matrix, seg_mask, object_ids)
+            
+            if len(candidates) == 0:
+                print("   ⚠️  未找到有效候选点")
+                consecutive_failures += 1
+                
+                # ✨ 立即重新生成物体，不要等待5次失败
+                print("   🔄 桌面为空或无有效候选，重新生成物体...")
+                from environment_setup import reset_objects_after_grasp
+                object_ids = reset_objects_after_grasp([], min_objects=3)  # 传入空列表强制重新生成
+                consecutive_failures = 0
+                
+                # 如果重新生成后仍然没有物体，结束这个场景
+                if len(object_ids) == 0:
+                    print("   ❌ 无法生成新物体，结束场景")
+                    break
+                    
+                # 重新生成后继续下一轮循环
+                continue
+            
+            # 重置连续失败计数器
+            consecutive_failures = 0
+            
+            # 测试第一个最有希望的候选（每次只测试一个）
+            u, v, theta_idx, theta = candidates[0]
+            
+            if depth[v, u] < MIN_DEPTH:
+                print("   ⚠️  候选深度无效")
+                continue
+            
+            total_samples += 1
+            
+            if visualize:
+                print(f"\n      === 测试候选 ===")
                 print(f"         像素: ({u}, {v}), 角度: {np.degrees(theta):.1f}°")
             
             world_pos = pixel_to_world(u, v, depth[v, u], view_matrix, proj_matrix)
@@ -468,29 +536,66 @@ def generate_scene_data(scene_id, num_objects=3, visualize=False):
             if visualize:
                 print(f"         世界坐标: [{world_pos[0]:.3f}, {world_pos[1]:.3f}, {world_pos[2]:.3f}]")
             
+            # 执行抓取测试
             success = fast_grasp_test(robot_id, world_pos, theta, object_ids, visualize)
             
             if success:
-                label[v, u, theta_idx] = 1
-                success_count += 1
+                total_success += 1
+                print(f"      ✅ 成功抓取！")
+                
+                # 创建/更新标签
+                if final_label is None:
+                    final_label = np.zeros((height, width, NUM_ANGLES + 1), dtype=np.uint8)
+                
+                final_label[v, u, theta_idx] = 1
+                
+                # 立即更新物体列表
+                object_ids = update_object_states(object_ids)
+                print(f"      📦 剩余物体: {len(object_ids)}")
+                
+                # ✨ 如果所有物体都被移除，结束循环
+                if len(object_ids) == 0:
+                    print("   🎉 所有物体已成功抓取！")
+                    break
+                
+            else:
+                print(f"      ❌ 抓取失败")
+                consecutive_failures += 1
             
-            reset_robot_home(robot_id)
+            if grasp_attempt % 10 == 0:
+                print(f"   📊 进度: {grasp_attempt} 次尝试, 成功: {total_success}, 成功率: {100*total_success/total_samples if total_samples > 0 else 0:.1f}%")
             
-            if not visualize and (idx + 1) % 10 == 0:
-                print(f"      {idx+1}/{len(candidates)} | 成功: {success_count}")
+            # 如果连续多次失败，重新生成物体
+            if consecutive_failures >= 10:
+                print("   🔄 连续失败过多，重新生成物体...")
+                from environment_setup import reset_objects_after_grasp
+                object_ids = reset_objects_after_grasp(object_ids, min_objects=2)
+                consecutive_failures = 0
+                
+                # 如果重新生成后仍然没有物体，结束这个场景
+                if len(object_ids) == 0:
+                    print("   ❌ 无法生成新物体，结束场景")
+                    break
         
-        has_success = label[:, :, :-1].sum(axis=2) > 0
-        label[:, :, -1] = (~has_success).astype(np.uint8)
-        
-        rate = success_count / len(candidates) if len(candidates) > 0 else 0
-        print(f"   ✅ 成功率: {rate*100:.1f}%")
-        
-        save_scene_data(scene_id, rgb, depth, label, {
-            "num_objects": num_objects,
-            "num_samples": len(candidates),
-            "success_count": success_count,
-            "success_rate": rate
-        })
+        # 完成最终标签
+        if final_label is not None:
+            # 设置背景标签
+            has_success = final_label[:, :, :-1].sum(axis=2) > 0
+            final_label[:, :, -1] = (~has_success).astype(np.uint8)
+            
+            final_rate = total_success / total_samples if total_samples > 0 else 0
+            print(f"\n   ✅ 总体成功率: {final_rate*100:.1f}% ({total_success}/{total_samples})")
+            
+            # 保存最终数据
+            save_scene_data(scene_id, final_rgb, final_depth, final_label, {
+                "num_objects": num_objects,
+                "num_samples": total_samples,
+                "success_count": int(total_success),
+                "success_rate": final_rate,
+                "grasp_attempts": grasp_attempt
+            })
+        else:
+            print(f"   ⚠️  场景 {scene_id} 没有生成任何数据")
         
         return True
     
@@ -501,8 +606,8 @@ def generate_scene_data(scene_id, num_objects=3, visualize=False):
         return False
     
     finally:
+        print(f"   🔚 断开连接...")
         p.disconnect()
-
 
 def save_scene_data(scene_id, rgb, depth, label, metadata):
     """保存数据"""
