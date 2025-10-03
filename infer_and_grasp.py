@@ -495,14 +495,334 @@ class AffordanceGraspPipeline:
 
         return success
 
-def main():
-    pipeline = AffordanceGraspPipeline()
-    success = pipeline.run_pipeline()
+    def run_multiple_tests(self, num_tests=10):
+        """运行多次测试并返回统计结果"""
+        successes = 0
+        results = []
 
-    # 保持仿真运行
-    while True:
-        p.stepSimulation()
-        time.sleep(1/240)
+        print(f"🧪 开始进行 {num_tests} 次抓取测试...")
+
+        # 跟踪当前物体ID
+        current_obj_ids = []
+
+        for test_idx in range(num_tests):
+            print(f"\n{'='*50}")
+            print(f"测试 {test_idx + 1}/{num_tests}")
+            print(f"{'='*50}")
+
+            try:
+                # 在测试之间管理物体（而不是重置整个仿真）
+                current_obj_ids = self.manage_objects_between_tests(current_obj_ids, min_objects=2)
+
+                # 运行单次pipeline测试
+                success = self.run_single_pipeline()
+                results.append(success)
+                if success:
+                    successes += 1
+
+                print(f"测试 {test_idx + 1} 结果: {'✅ 成功' if success else '❌ 失败'}")
+
+            except Exception as e:
+                print(f"测试 {test_idx + 1} 异常: {e}")
+                results.append(False)
+
+        # 打印最终统计
+        success_rate = (successes / num_tests) * 100
+        print(f"\n{'='*60}")
+        print("📊 测试结果统计")
+        print(f"总测试次数: {num_tests}")
+        print(f"成功次数: {successes}")
+        print(f"成功率: {success_rate:.1f}%")
+        print(f"{'='*60}")
+
+        if success_rate >= 70:
+            print("🎉 模型表现优秀！")
+        elif success_rate >= 50:
+            print("👍 模型表现良好")
+        else:
+            print("⚠️ 模型需要改进")
+
+        return results, success_rate
+
+    def run_single_pipeline(self):
+        """运行单次pipeline测试（不包含初始化）"""
+        print("=== 捕获场景 ===")
+        rgb, depth = self.capture_scene()
+
+        # 记录初始物体高度
+        obj_ids = []
+        for i in range(p.getNumBodies()):
+            if p.getBodyInfo(i)[0].decode() not in ['plane', 'table', 'panda']:
+                obj_ids.append(i)
+        initial_heights = [p.getBasePositionAndOrientation(obj_id)[0][2] for obj_id in obj_ids]
+
+        print("=== 推理可供性 ===")
+        affordance_prob, angle_degrees = self.infer_affordance(rgb, depth)
+
+        print("=== 选择最佳抓取点 ===")
+        u, v, angle, affordance_value = self.find_best_grasp_point(affordance_prob, angle_degrees, depth)
+        print(f"最佳抓取点: 像素({u}, {v}), 角度: {angle:.1f}°, 可供性: {affordance_value:.3f}")
+
+        print("=== 反投影到世界坐标 ===")
+        grasp_point_world = self.pixel_to_world(u, v, depth)
+        print(f"世界坐标: {grasp_point_world}")
+
+        # 提取坐标
+        x, y, z = grasp_point_world
+
+        # 额外的机器人基座距离检查 - 避免模型预测靠近机器人基座的错误点
+        robot_base_dist = np.sqrt(x**2 + y**2)
+        if robot_base_dist < 0.25:  # 如果距离机器人基座太近，强制跳过
+            print(f"⚠️  模型预测的抓取点太靠近机器人基座 (距离={robot_base_dist:.3f}m)，跳过")
+            return False
+
+        # 检查工作空间 - 避免太靠近机器人导致关节角度过大
+        dist = np.sqrt(x**2 + y**2)
+        workspace_valid = (
+            dist >= 0.25 and dist <= 0.85 and  # 增加最小距离到25cm，避免极端关节角度
+            abs(y) <= 0.5 and
+            z >= TABLE_TOP_Z - 0.05 and z <= TABLE_TOP_Z + 0.15
+        )
+        print(f"工作空间检查: 距离={dist:.3f}m, Y={y:.3f}m, Z={z:.3f}m, 桌面={TABLE_TOP_Z:.3f}m, 有效={workspace_valid}")
+
+        if not workspace_valid:
+            print("抓取点超出工作空间，跳过")
+            return False
+
+        print("=== 生成抓取姿态 ===")
+        pre_grasp_pos, grasp_pos, orn = self.generate_grasp_pose(grasp_point_world, angle, depth[v, u])
+
+        print("=== 执行抓取 ===")
+        # 每次抓取前重置机器人到home位置
+        self.reset_robot_home()
+        success = self.execute_grasp(pre_grasp_pos, grasp_pos, orn)
+
+        print("=== 评估成功 ===")
+        success = self.evaluate_grasp_success(obj_ids, initial_heights)
+        print(f"抓取成功: {success}")
+
+        return success
+
+    def manage_objects_between_tests(self, obj_ids, min_objects=2):
+        """在测试之间管理物体状态，类似于src/afford_data_gen.py的逻辑"""
+        print("🔄 检查物体状态...")
+
+        # 使用environment_setup.py的update_object_states逻辑
+        active_objects = self.update_object_states(obj_ids)
+
+        if len(active_objects) < min_objects:
+            print(f"⚠️  只有 {len(active_objects)} 个物体 remaining, 重新生成...")
+
+            # 清理工作空间（移除超出范围的物体）
+            self.cleanup_workspace()
+
+            # 等待物理稳定
+            for _ in range(30):
+                p.stepSimulation()
+
+            # 生成新物体
+            new_objects = self.create_objects_like_environment_setup(num_objects=min_objects)
+
+            # 让新物体稳定
+            print("⏳ 等待新物体稳定...")
+            for _ in range(50):
+                p.stepSimulation()
+
+            return new_objects
+        else:
+            print(f"✅ 还有 {len(active_objects)} 个有效物体，继续使用")
+            return active_objects
+
+    def update_object_states(self, object_ids):
+        """检查哪些物体还在桌子上，移除超出工作空间的物体ID"""
+        TABLE_TOP_Z = 0.625  # 从geom.py导入
+        OBJECT_SPAWN_CENTER = [0.60, 0, TABLE_TOP_Z]  # 从geom.py导入
+
+        active_objects = []
+        removed_objects = []
+
+        for obj_id in object_ids:
+            try:
+                # 跳过环境物体ID
+                if obj_id <= 2:
+                    continue
+
+                pos, _ = p.getBasePositionAndOrientation(obj_id)
+
+                # 位置检查
+                in_workspace = (
+                    pos[2] > TABLE_TOP_Z - 0.1 and  # 没有掉到桌面下方
+                    pos[2] < TABLE_TOP_Z + 0.5 and  # 没有太高（被带走）
+                    abs(pos[0] - OBJECT_SPAWN_CENTER[0]) < 0.4 and  # X方向仍在范围内
+                    abs(pos[1] - OBJECT_SPAWN_CENTER[1]) < 0.4      # Y方向仍在范围内
+                )
+
+                if in_workspace:
+                    active_objects.append(obj_id)
+                else:
+                    removed_objects.append(obj_id)
+
+            except:
+                # 物体可能已被移除
+                removed_objects.append(obj_id)
+
+        # 物理移除超出工作空间的物体
+        if removed_objects:
+            print(f"   🧹 清理 {len(removed_objects)} 个超出工作空间的物体...")
+            for obj_id in removed_objects:
+                if obj_id > 2:  # 保护环境物体
+                    try:
+                        p.removeBody(obj_id)
+                    except:
+                        pass
+
+        return active_objects
+
+    def cleanup_workspace(self):
+        """清理工作空间中的所有动态物体"""
+        TABLE_TOP_Z = 0.625
+
+        # 获取所有物体ID
+        all_bodies = []
+        for i in range(p.getNumBodies()):
+            body_id = p.getBodyUniqueId(i)
+            all_bodies.append(body_id)
+
+        removed_count = 0
+        for body_id in all_bodies:
+            try:
+                # 检查是否是动态物体
+                body_info = p.getBodyInfo(body_id)
+                body_name = body_info[0].decode('utf-8') if body_info[0] else ""
+
+                # 跳过环境物体
+                protected_names = ['plane', 'table', 'panda', 'franka']
+                if any(name in body_name.lower() for name in protected_names):
+                    continue
+
+                if body_id <= 2:
+                    continue
+
+                # 检查物体位置
+                pos, _ = p.getBasePositionAndOrientation(body_id)
+
+                # 保守的清理范围
+                should_remove = (
+                    pos[2] < TABLE_TOP_Z - 0.3 or  # 掉到桌面下方30cm
+                    pos[2] > TABLE_TOP_Z + 1.5 or  # 飞到桌面上方1.5m
+                    abs(pos[0]) > 1.2 or           # X方向超出1.2m
+                    abs(pos[1]) > 1.2              # Y方向超出1.2m
+                )
+
+                if should_remove:
+                    p.removeBody(body_id)
+                    removed_count += 1
+
+            except Exception as e:
+                continue
+
+        if removed_count > 0:
+            print(f"   ✅ 清理完成，移除了 {removed_count} 个远程物体")
+
+    def create_objects_like_environment_setup(self, num_objects=3):
+        """使用与environment_setup.py相同的逻辑创建物体"""
+        TABLE_TOP_Z = 0.625
+        OBJECT_SPAWN_CENTER = [0.60, 0, TABLE_TOP_Z]
+        MIN_OBJECT_DISTANCE = 0.06
+        MAX_SPAWN_ATTEMPTS = 20
+
+        # Franka Panda夹爪约束
+        MAX_GRIPPER_OPENING = 0.08
+        SAFE_OBJECT_WIDTH = 0.035
+
+        object_ids = []
+        object_positions = []
+
+        num_objects = min(num_objects, 5)
+
+        for i in range(num_objects):
+            placed = False
+            attempts = 0
+            current_min_distance = MIN_OBJECT_DISTANCE
+
+            while not placed and attempts < MAX_SPAWN_ATTEMPTS:
+                attempts += 1
+
+                # 生成随机位置
+                x_pos = OBJECT_SPAWN_CENTER[0] + np.random.uniform(-0.15, 0.15)
+                y_pos = OBJECT_SPAWN_CENTER[1] + np.random.uniform(-0.25, 0.25)
+                candidate_pos = [x_pos, y_pos]
+
+                # 检查与其他物体的距离
+                too_close = False
+                if len(object_positions) > 0:
+                    for existing_pos in object_positions:
+                        distance = np.sqrt((candidate_pos[0] - existing_pos[0])**2 +
+                                         (candidate_pos[1] - existing_pos[1])**2)
+                        if distance < current_min_distance:
+                            too_close = True
+                            break
+
+                if not too_close:
+                    placed = True
+
+                # 如果放置困难，逐渐降低距离要求
+                elif attempts > MAX_SPAWN_ATTEMPTS // 2:
+                    current_min_distance = MIN_OBJECT_DISTANCE * 0.8
+
+            if placed:
+                object_positions.append(candidate_pos)
+
+                shape_type = np.random.choice([p.GEOM_BOX, p.GEOM_CYLINDER])
+                color = [np.random.random(), np.random.random(), np.random.random(), 1]
+
+                if shape_type == p.GEOM_BOX:
+                    half_extents = [
+                        np.random.uniform(0.02, SAFE_OBJECT_WIDTH/2),
+                        np.random.uniform(0.02, SAFE_OBJECT_WIDTH/2),
+                        np.random.uniform(0.02, 0.025)
+                    ]
+                    shape = p.createCollisionShape(p.GEOM_BOX, halfExtents=half_extents)
+                    visual_shape = p.createVisualShape(p.GEOM_BOX, halfExtents=half_extents, rgbaColor=color)
+                    z_pos = TABLE_TOP_Z + half_extents[2]
+                elif shape_type == p.GEOM_CYLINDER:
+                    radius = np.random.uniform(0.008, SAFE_OBJECT_WIDTH/2)
+                    height = np.random.uniform(0.02, 0.04)
+                    shape = p.createCollisionShape(p.GEOM_CYLINDER, radius=radius, height=height)
+                    visual_shape = p.createVisualShape(p.GEOM_CYLINDER, radius=radius, length=height, rgbaColor=color)
+                    z_pos = TABLE_TOP_Z + height / 2
+                else: # 球体
+                    radius = np.random.uniform(0.008, SAFE_OBJECT_WIDTH/2)
+                    shape = p.createCollisionShape(p.GEOM_SPHERE, radius=radius)
+                    visual_shape = p.createVisualShape(p.GEOM_SPHERE, radius=radius, rgbaColor=color)
+                    z_pos = TABLE_TOP_Z + radius
+
+                body = p.createMultiBody(
+                    baseMass=np.random.uniform(0.05, 0.2),
+                    baseCollisionShapeIndex=shape,
+                    baseVisualShapeIndex=visual_shape,
+                    basePosition=[x_pos, y_pos, z_pos + 0.005],
+                    baseOrientation=p.getQuaternionFromEuler([0, 0, np.random.uniform(0, 3.14)])
+                )
+                p.changeDynamics(body, -1, lateralFriction=1.5, restitution=0.1)
+                object_ids.append(body)
+
+        return object_ids
+
+def main():
+    num_tests = 10  # 测试次数
+
+    # 创建单个pipeline实例并初始化
+    pipeline = AffordanceGraspPipeline()
+    pipeline.initialize_simulation()  # 初始化仿真
+
+    try:
+        # 运行多次测试
+        results, success_rate = pipeline.run_multiple_tests(num_tests)
+    finally:
+        # 清理
+        if pipeline.physics_client:
+            p.disconnect()
 
 if __name__ == '__main__':
     main()
