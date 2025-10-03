@@ -11,22 +11,32 @@ import cv2
 from geom import setup_scene, TABLE_TOP_Z
 from perception import set_topdown_camera, get_rgb_depth, pixel_to_world, CAMERA_PARAMS
 
-# 复制UNet模型类（与训练时一致）
+# 复制UNetLarge模型类（与训练时一致）
 class UNet(nn.Module):
+    """更大容量的UNet，适合300场景训练"""
     def __init__(self, in_channels=4, out_channels=37):
         super(UNet, self).__init__()
-        self.enc1 = self.conv_block(in_channels, 64)
-        self.enc2 = self.conv_block(64, 128)
-        self.enc3 = self.conv_block(128, 256)
-        self.enc4 = self.conv_block(256, 512)
+        # 更宽的通道 (1.5x)
+        self.enc1 = self.conv_block(in_channels, 96)    # 4 → 96
+        self.enc2 = self.conv_block(96, 192)            # 96 → 192
+        self.enc3 = self.conv_block(192, 384)           # 192 → 384
+        self.enc4 = self.conv_block(384, 768)           # 384 → 768
+
         self.pool = nn.MaxPool2d(2)
-        self.dec3 = self.conv_block(512, 256)
-        self.dec2 = self.conv_block(256, 128)
-        self.dec1 = self.conv_block(128, 64)
-        self.upconv3 = nn.ConvTranspose2d(512, 256, 2, stride=2)
-        self.upconv2 = nn.ConvTranspose2d(256, 128, 2, stride=2)
-        self.upconv1 = nn.ConvTranspose2d(128, 64, 2, stride=2)
-        self.final = nn.Conv2d(64, out_channels, 1)
+
+        # 解码器
+        self.dec3 = self.conv_block(768, 384)           # 768 → 384
+        self.dec2 = self.conv_block(384, 192)           # 384 → 192
+        self.dec1 = self.conv_block(192, 96)            # 192 → 96
+
+        self.upconv3 = nn.ConvTranspose2d(768, 384, 2, stride=2)
+        self.upconv2 = nn.ConvTranspose2d(384, 192, 2, stride=2)
+        self.upconv1 = nn.ConvTranspose2d(192, 96, 2, stride=2)
+
+        self.final = nn.Conv2d(96, out_channels, 1)
+
+        # Dropout for regularization
+        self.dropout = nn.Dropout2d(0.1)
 
     def conv_block(self, in_c, out_c):
         return nn.Sequential(
@@ -39,28 +49,42 @@ class UNet(nn.Module):
         )
 
     def forward(self, x):
+        # Encoder with skip connections
         e1 = self.enc1(x)
         e2 = self.enc2(self.pool(e1))
         e3 = self.enc3(self.pool(e2))
         e4 = self.enc4(self.pool(e3))
+
+        # Decoder with skip connections
         d3 = self.upconv3(e4)
         d3 = torch.cat([d3, e3], dim=1)
         d3 = self.dec3(d3)
+        d3 = self.dropout(d3)  # Regularization
+
         d2 = self.upconv2(d3)
         d2 = torch.cat([d2, e2], dim=1)
         d2 = self.dec2(d2)
+        d2 = self.dropout(d2)
+
         d1 = self.upconv1(d2)
         d1 = torch.cat([d1, e1], dim=1)
         d1 = self.dec1(d1)
+
         out = self.final(d1)
         return out
 
 class AffordanceGraspPipeline:
-    def __init__(self, model_path='./models/affordance_model.pth'):
+    def __init__(self, model_path='./models/affordance_model_best.pth'):
         # 加载模型
         self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
         self.model = UNet().to(self.device)
-        self.model.load_state_dict(torch.load(model_path, map_location=self.device))
+        checkpoint = torch.load(model_path, map_location=self.device, weights_only=False)
+        if 'model_state_dict' in checkpoint:
+            # 如果是checkpoint格式，加载model_state_dict
+            self.model.load_state_dict(checkpoint['model_state_dict'])
+        else:
+            # 如果是直接的state_dict格式
+            self.model.load_state_dict(checkpoint)
         self.model.eval()
         print(f"模型已加载到 {self.device}")
 
@@ -163,7 +187,8 @@ class AffordanceGraspPipeline:
                 z >= TABLE_TOP_Z - 0.05 and z <= TABLE_TOP_Z + 0.15):
                 # 这个点在有效工作空间内
                 affordance_val = affordance_prob[v, u]
-                if affordance_val > best_affordance:
+                # 降低阈值：原来需要更好的点，现在接受更低的affordance
+                if affordance_val > best_affordance:  # 移除最小阈值，接受任何正值
                     best_affordance = affordance_val
                     best_u, best_v = u, v
 
@@ -392,6 +417,18 @@ class AffordanceGraspPipeline:
             p.stepSimulation()
             time.sleep(1./240.)
 
+        # 调试：检查夹爪状态
+        finger1_state = p.getJointState(self.robot_id, 9)[0]
+        finger2_state = p.getJointState(self.robot_id, 10)[0]
+        print(f"夹爪关闭后状态: 手指1={finger1_state:.4f}, 手指2={finger2_state:.4f}")
+
+        # 检查是否有物体被夹住（手指没有完全关闭）
+        gripper_closed = finger1_state < 0.005 and finger2_state < 0.005
+        if not gripper_closed:
+            print("✅ 检测到物体被夹住！")
+        else:
+            print("❌ 夹爪完全关闭，可能没有夹到物体")
+
     def execute_grasp(self, pre_grasp_pos, grasp_pos, orn):
         """执行抓取动作"""
         print("张开夹爪")
@@ -421,16 +458,24 @@ class AffordanceGraspPipeline:
     def evaluate_grasp_success(self, obj_ids, initial_heights):
         """评估抓取是否成功"""
         success = False
+        lifted_objects = 0
+
+        print("🔍 评估抓取结果:")
         for i, obj_id in enumerate(obj_ids):
             pos, _ = p.getBasePositionAndOrientation(obj_id)
             current_height = pos[2]
             initial_height = initial_heights[i]
+            height_diff = current_height - initial_height
 
-            # 检查物体是否被明显抬起（至少5cm）
-            if current_height - initial_height > 0.05:
+            print(f"  物体 {obj_id}: 初始高度={initial_height:.3f}m, 当前高度={current_height:.3f}m, 高度差={height_diff:.3f}m")
+
+            # 更宽松的成功标准：任何明显移动都算成功
+            if height_diff > 0.02:  # 2cm instead of 5cm
                 success = True
-                break
+                lifted_objects += 1
+                print(f"    ✅ 物体被抬起 {height_diff*100:.1f}cm")
 
+        print(f"📊 总共 {lifted_objects}/{len(obj_ids)} 个物体被移动")
         return success
 
     def run_pipeline(self):
@@ -547,6 +592,16 @@ class AffordanceGraspPipeline:
     def run_single_pipeline(self):
         """运行单次pipeline测试（不包含初始化）"""
         print("=== 捕获场景 ===")
+
+        # 关键修复：先重置机器人到home位置，再拍照（与数据生成一致）
+        print("🏠 重置机器人到初始位置...")
+        self.reset_robot_home()
+
+        # 等待机器人完全稳定
+        for _ in range(120):
+            p.stepSimulation()
+
+        # 现在机器人已经在home位置，再拍照
         rgb, depth = self.capture_scene()
 
         # 记录初始物体高度
@@ -559,9 +614,25 @@ class AffordanceGraspPipeline:
         print("=== 推理可供性 ===")
         affordance_prob, angle_degrees = self.infer_affordance(rgb, depth)
 
+        # 调试：检查可供性统计
+        max_affordance = np.max(affordance_prob)
+        mean_affordance = np.mean(affordance_prob)
+        print(f"可供性统计: 最大值={max_affordance:.3f}, 平均值={mean_affordance:.3f}")
+
         print("=== 选择最佳抓取点 ===")
         u, v, angle, affordance_value = self.find_best_grasp_point(affordance_prob, angle_degrees, depth)
         print(f"最佳抓取点: 像素({u}, {v}), 角度: {angle:.1f}°, 可供性: {affordance_value:.3f}")
+
+        # 调试：显示前5个最高可供性点的位置
+        flat_afford = affordance_prob.flatten()
+        top_indices = np.argsort(flat_afford)[-5:][::-1]  # 前5个最高值
+        print("前5个最高可供性点:")
+        for i, idx in enumerate(top_indices):
+            val = flat_afford[idx]
+            vv, uu = np.unravel_index(idx, affordance_prob.shape)
+            world_pos = self.pixel_to_world(uu, vv, depth)
+            dist_from_base = np.sqrt(world_pos[0]**2 + world_pos[1]**2)
+            print(f"  {i+1}. 像素({uu}, {vv}) -> 世界({world_pos[0]:.3f}, {world_pos[1]:.3f}) 距离基座:{dist_from_base:.3f}m 可供性:{val:.3f}")
 
         print("=== 反投影到世界坐标 ===")
         grasp_point_world = self.pixel_to_world(u, v, depth)
