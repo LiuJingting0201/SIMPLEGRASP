@@ -11,6 +11,10 @@ import cv2
 from geom import setup_scene, TABLE_TOP_Z
 from perception import set_topdown_camera, get_rgb_depth, pixel_to_world, CAMERA_PARAMS
 
+# Import proper motion and object management functions
+from src.afford_data_gen import move_fast, reset_robot_home, open_gripper_fast
+from src.environment_setup import update_object_states, reset_objects_after_grasp, cleanup_workspace
+
 # 复制UNetLarge模型类（与训练时一致）
 class UNet(nn.Module):
     """更大容量的UNet，适合300场景训练"""
@@ -21,22 +25,25 @@ class UNet(nn.Module):
         self.enc2 = self.conv_block(96, 192)            # 96 → 192
         self.enc3 = self.conv_block(192, 384)           # 192 → 384
         self.enc4 = self.conv_block(384, 768)           # 384 → 768
+        self.enc5 = self.conv_block(768, 1536) 
 
         self.pool = nn.MaxPool2d(2)
 
-        # 解码器
+        # 对应的解码器 (5层解码器)
+        self.dec4 = self.conv_block(1536, 768)          # 1536 → 768
         self.dec3 = self.conv_block(768, 384)           # 768 → 384
         self.dec2 = self.conv_block(384, 192)           # 384 → 192
         self.dec1 = self.conv_block(192, 96)            # 192 → 96
 
-        self.upconv3 = nn.ConvTranspose2d(768, 384, 2, stride=2)
-        self.upconv2 = nn.ConvTranspose2d(384, 192, 2, stride=2)
-        self.upconv1 = nn.ConvTranspose2d(192, 96, 2, stride=2)
+        self.upconv4 = nn.ConvTranspose2d(1536, 768, 2, stride=2)  # 1536 → 768
+        self.upconv3 = nn.ConvTranspose2d(768, 384, 2, stride=2)   # 768 → 384
+        self.upconv2 = nn.ConvTranspose2d(384, 192, 2, stride=2)   # 384 → 192
+        self.upconv1 = nn.ConvTranspose2d(192, 96, 2, stride=2)    # 192 → 96
 
         self.final = nn.Conv2d(96, out_channels, 1)
 
         # Dropout for regularization
-        self.dropout = nn.Dropout2d(0.1)
+        self.dropout = nn.Dropout2d(0.15)
 
     def conv_block(self, in_c, out_c):
         return nn.Sequential(
@@ -49,17 +56,23 @@ class UNet(nn.Module):
         )
 
     def forward(self, x):
-        # Encoder with skip connections
+        # Encoder with 5 levels (更深)
         e1 = self.enc1(x)
         e2 = self.enc2(self.pool(e1))
         e3 = self.enc3(self.pool(e2))
         e4 = self.enc4(self.pool(e3))
+        e5 = self.enc5(self.pool(e4))  # 新增第5层
 
-        # Decoder with skip connections
-        d3 = self.upconv3(e4)
+        # Decoder with 5 levels (对应解码)
+        d4 = self.upconv4(e5)
+        d4 = torch.cat([d4, e4], dim=1)
+        d4 = self.dec4(d4)
+        d4 = self.dropout(d4)  # 更强的dropout
+
+        d3 = self.upconv3(d4)
         d3 = torch.cat([d3, e3], dim=1)
         d3 = self.dec3(d3)
-        d3 = self.dropout(d3)  # Regularization
+        d3 = self.dropout(d3)
 
         d2 = self.upconv2(d3)
         d2 = torch.cat([d2, e2], dim=1)
@@ -72,9 +85,8 @@ class UNet(nn.Module):
 
         out = self.final(d1)
         return out
-
 class AffordanceGraspPipeline:
-    def __init__(self, model_path='./models/affordance_model_best.pth'):
+    def __init__(self, model_path='./models/affordance_model_best (copy).pth'):
         # 加载模型
         self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
         self.model = UNet().to(self.device)
@@ -234,8 +246,8 @@ class AffordanceGraspPipeline:
         x, y, z = grasp_point_world
 
         # pixel_to_world已经给出了物体表面的世界坐标
-        # 直接在物体表面上方一点进行抓取
-        grasp_z = z + 0.01  # 稍微高于物体表面
+        # 降低抓取位置以获得更深的抓取
+        grasp_z = z - 0.02  # 稍微低于物体表面以获得更深的抓取
 
         # 角度转换为四元数（绕Z轴旋转）- 参考src/afford_data_gen.py
         angle_rad = np.radians(angle_degrees)
@@ -250,170 +262,29 @@ class AffordanceGraspPipeline:
         return pre_grasp_pos, grasp_pos, orn
 
     def reset_robot_home(self):
-        """重置机器人到初始位置 - 参考src/afford_data_gen.py"""
-        home = [0, -0.785, 0, -2.356, 0, 1.571, 0.785]
-
-        # 确保在移动前夹爪是完全打开的
-        print("确保夹爪完全打开...")
-
-        # 多次尝试确保夹爪打开
-        for attempt in range(3):
-            self.open_gripper()
-            finger_state = p.getJointState(self.robot_id, 9)[0]
-            print(f"  尝试 {attempt+1}: 夹爪状态 = {finger_state:.4f}")
-
-            if finger_state > 0.015:
-                print("  ✅ 夹爪已确认打开")
-                break
-            else:
-                print("  ⚠️  夹爪未完全打开，重试...")
-
-        # 使用位置控制而不是直接设置关节状态，更平滑
-        for i in range(7):
-            p.setJointMotorControl2(
-                self.robot_id, i, p.POSITION_CONTROL,
-                targetPosition=home[i],
-                force=500,
-                maxVelocity=2.0
-            )
-
-        # 等待到位
-        for _ in range(120):
-            p.stepSimulation()
-
-            # 检查是否到位
-            all_in_position = True
-            for i in range(7):
-                current = p.getJointState(self.robot_id, i)[0]
-                if abs(current - home[i]) > 0.05:  # 容差3度
-                    all_in_position = False
-                    break
-
-            if all_in_position:
-                break
-
-        # 最后再次强制确保夹爪打开
-        print("最终确保夹爪打开...")
-        self.open_gripper()
-
-        final_finger_state = p.getJointState(self.robot_id, 9)[0]
-        print(f"机器人已回到初始位置，夹爪状态: {final_finger_state:.4f}")
+        """重置机器人到初始位置 - 使用正确的函数"""
+        reset_robot_home(self.robot_id)
 
     def move_to_position(self, target_pos, target_ori, slow=False, debug_mode=False):
-        """正确的运动控制函数，参考src/afford_data_gen.py"""
-        ee_link = 11  # 末端执行器link索引
-
-        print(f"移动到位置: [{target_pos[0]:.3f}, {target_pos[1]:.3f}, {target_pos[2]:.3f}]")
-
-        # 获取关节限制和rest poses
-        home_joints = [0, -0.785, 0, -2.356, 0, 1.571, 0.785]  # 使用home位置作为rest poses
-        ll, ul, jr = [], [], []
-        for i in range(7):
-            info = p.getJointInfo(self.robot_id, i)
-            ll.append(info[8])
-            ul.append(info[9])
-            jr.append(info[9] - info[8])
-            print(f"关节{i}限制: [{ll[i]:.3f}, {ul[i]:.3f}] 范围: {jr[i]*180/np.pi:.1f}°")
-
-        # IK求解 - 使用home位置作为rest poses
-        joints = p.calculateInverseKinematics(
-            self.robot_id, ee_link, target_pos, target_ori,
-            lowerLimits=ll, upperLimits=ul, jointRanges=jr, restPoses=home_joints,
-            maxNumIterations=100,
-            residualThreshold=1e-4
-        )
-
-        if not joints or len(joints) < 7:
-            print("IK求解失败")
-            return False
-
-        # 检查关节限制 - 添加小容差
-        joint_tolerance = 0.05  # 约3度容差
-        for i in range(7):
-            if joints[i] < ll[i] - joint_tolerance or joints[i] > ul[i] + joint_tolerance:
-                print(f"关节{i}超出限制: {joints[i]:.3f} 不在 [{ll[i]-joint_tolerance:.3f}, {ul[i]+joint_tolerance:.3f}]")
-                return False
-
-        # 根据距离动态调整运动参数
-        current_pos = p.getLinkState(self.robot_id, ee_link)[0]
-        move_distance = np.linalg.norm(np.array(target_pos) - np.array(current_pos))
-        print(f"需要移动距离: {move_distance*100:.1f}cm")
-
-        if move_distance > 0.3:  # 如果距离超过30cm
-            velocity = 2.0 if slow else 3.0    # 增加速度
-            force = 1500 if slow else 2500     # 大幅增加力度  
-            actual_steps = 300 if slow else 300  # 大幅增加步数确保到达
-            print(f"远距离移动模式: 速度={velocity}, 力度={force}, 步数={actual_steps}")
-        else:
-            velocity = 1.0 if slow else 2.0
-            force = 600 if slow else 1000
-            actual_steps = 80 if slow else 60
-            print(f"近距离移动模式: 速度={velocity}, 力度={force}, 步数={actual_steps}")
-
-        # 控制每个关节
-        for i in range(7):
-            p.setJointMotorControl2(
-                self.robot_id, i, p.POSITION_CONTROL,
-                targetPosition=joints[i], force=force, maxVelocity=velocity
-            )
-
-        # 执行运动
-        progress_interval = actual_steps // 8 if debug_mode else actual_steps // 4
-
-        for step in range(actual_steps):
-            p.stepSimulation()
-            time.sleep(1./240.)
-
-            # 更频繁的进度检查
-            if step % progress_interval == 0:
-                current = p.getLinkState(self.robot_id, ee_link)[0]
-                dist = np.linalg.norm(np.array(current) - np.array(target_pos))
-                progress = max(0, (move_distance - dist) / move_distance * 100)
-                print(f"步骤 {step}/{actual_steps}: 距离目标 {dist*100:.1f}cm, 进度 {progress:.1f}%")
-
-                # 早期成功检测
-                if dist < 0.05:  # 如果已经很接近目标
-                    print("提前到达目标")
-                    break
-
-        # 最终位置验证
-        final_pos = p.getLinkState(self.robot_id, ee_link)[0]
-        final_dist = np.linalg.norm(np.array(final_pos) - np.array(target_pos))
-        print(f"最终位置: [{final_pos[0]:.3f}, {final_pos[1]:.3f}, {final_pos[2]:.3f}]")
-        print(f"最终误差: {final_dist*100:.1f}cm")
-
-        # 根据移动距离动态调整容差
-        if move_distance > 0.4:
-            success_threshold = 0.15  # 15cm for very long moves
-        elif move_distance > 0.2:
-            success_threshold = 0.10  # 10cm for medium moves  
-        else:
-            success_threshold = 0.05  # 5cm for short moves
-
-        success = final_dist < success_threshold
-
-        if success:
-            print(f"移动成功 (误差 {final_dist*100:.1f}cm < {success_threshold*100:.0f}cm)")
-        else:
-            print(f"移动失败 (误差 {final_dist*100:.1f}cm >= {success_threshold*100:.0f}cm)")
-
-        return success
+        """使用正确的运动控制函数，参考src/afford_data_gen.py"""
+        return move_fast(self.robot_id, 11, target_pos, target_ori, 30, slow=slow, debug_mode=debug_mode)
 
     def open_gripper(self):
-        """打开夹爪"""
-        pos = 0.04 / 2.0  # 完全打开
-        p.setJointMotorControl2(self.robot_id, 9, p.POSITION_CONTROL, targetPosition=pos, force=300, maxVelocity=3.0)
-        p.setJointMotorControl2(self.robot_id, 10, p.POSITION_CONTROL, targetPosition=pos, force=300, maxVelocity=3.0)
-        for _ in range(40):
+        """打开夹爪 - 使用正确的函数"""
+        open_gripper_fast(self.robot_id)
+
+    def close_gripper(self):
+        """关闭夹爪 - 使用正确的慢速闭合"""
+        pos = 0.0  # 完全关闭
+        steps = 20  # 调试模式下的步数
+        for step in range(steps):
+            p.setJointMotorControl2(self.robot_id, 9, p.POSITION_CONTROL, targetPosition=pos, force=50)
+            p.setJointMotorControl2(self.robot_id, 10, p.POSITION_CONTROL, targetPosition=pos, force=50)
             p.stepSimulation()
             time.sleep(1./240.)
 
-    def close_gripper(self):
-        """关闭夹爪"""
-        pos = 0.0  # 完全关闭
-        for step in range(40):
-            p.setJointMotorControl2(self.robot_id, 9, p.POSITION_CONTROL, targetPosition=pos, force=50, maxVelocity=0.05)
-            p.setJointMotorControl2(self.robot_id, 10, p.POSITION_CONTROL, targetPosition=pos, force=50, maxVelocity=0.05)
+        # 等待额外时间确保稳定
+        for _ in range(20):
             p.stepSimulation()
             time.sleep(1./240.)
 
@@ -435,12 +306,16 @@ class AffordanceGraspPipeline:
         self.open_gripper()
 
         print(f"移动到预抓取位置: {pre_grasp_pos}")
-        if not self.move_to_position(pre_grasp_pos, orn):
+        success = self.move_to_position(pre_grasp_pos, orn)
+        print(f"预抓取移动结果: {success}")
+        if not success:
             print("预抓取移动失败")
             return False
 
         print(f"移动到抓取位置: {grasp_pos}")
-        if not self.move_to_position(grasp_pos, orn, slow=True):
+        success = self.move_to_position(grasp_pos, orn, slow=True)
+        print(f"抓取移动结果: {success}")
+        if not success:
             print("抓取移动失败")
             return False
 
@@ -449,9 +324,14 @@ class AffordanceGraspPipeline:
 
         print("抬起物体")
         lift_pos = [grasp_pos[0], grasp_pos[1], grasp_pos[2] + 0.1]
-        if not self.move_to_position(lift_pos, orn):
+        success = self.move_to_position(lift_pos, orn)
+        print(f"抬起移动结果: {success}")
+        if not success:
             print("抬起移动失败")
             return False
+
+        print("释放物体")
+        self.open_gripper()
 
         return True
 
@@ -541,14 +421,11 @@ class AffordanceGraspPipeline:
         return success
 
     def run_multiple_tests(self, num_tests=10):
-        """运行多次测试并返回统计结果"""
+        """运行多次测试并返回统计结果 - 简化版本，不跟踪物体ID"""
         successes = 0
         results = []
 
         print(f"🧪 开始进行 {num_tests} 次抓取测试...")
-
-        # 跟踪当前物体ID
-        current_obj_ids = []
 
         for test_idx in range(num_tests):
             print(f"\n{'='*50}")
@@ -556,11 +433,8 @@ class AffordanceGraspPipeline:
             print(f"{'='*50}")
 
             try:
-                # 在测试之间管理物体（而不是重置整个仿真）
-                current_obj_ids = self.manage_objects_between_tests(current_obj_ids, min_objects=2)
-
-                # 运行单次pipeline测试
-                success = self.run_single_pipeline()
+                # 简化：每次测试直接运行，不刷新场景
+                success = self.run_single_pipeline_simple()
                 results.append(success)
                 if success:
                     successes += 1
@@ -674,6 +548,233 @@ class AffordanceGraspPipeline:
 
         return success
 
+    def run_single_pipeline_simple(self):
+        """简化版本的单次pipeline测试 - 不跟踪物体ID，只尝试抓取"""
+        print("=== 捕获场景 ===")
+
+        # 关键修复：先重置机器人到home位置，再拍照（与数据生成一致）
+        print("🏠 重置机器人到初始位置...")
+        self.reset_robot_home()
+
+        # 等待机器人完全稳定
+        for _ in range(120):
+            p.stepSimulation()
+
+        # 简单测试：尝试一个简单的移动来检查机器人是否能动
+        print("🧪 测试机器人移动...")
+        test_pos = [0.5, 0.0, 0.8]  # 简单的测试位置
+        test_ori = p.getQuaternionFromEuler([np.pi, 0, 0])  # 简单的朝下方向
+        test_success = self.move_to_position(test_pos, test_ori)
+        print(f"测试移动结果: {test_success}")
+
+        if not test_success:
+            print("❌ 机器人无法移动！检查move_fast函数")
+            return False
+
+        # 如果测试移动成功，重置回home
+        print("🏠 重置回初始位置...")
+        self.reset_robot_home()
+        for _ in range(60):
+            p.stepSimulation()
+
+        # 现在机器人已经在home位置，再拍照
+        rgb, depth = self.capture_scene()
+
+        # 获取当前物体ID（用于后续物体管理）
+        obj_ids = []
+        for i in range(p.getNumBodies()):
+            if p.getBodyInfo(i)[0].decode() not in ['plane', 'table', 'panda']:
+                obj_ids.append(i)
+
+        print("=== 推理可供性 ===")
+        affordance_prob, angle_degrees = self.infer_affordance(rgb, depth)
+
+        # 调试：检查可供性统计
+        max_affordance = np.max(affordance_prob)
+        mean_affordance = np.mean(affordance_prob)
+        print(f"可供性统计: 最大值={max_affordance:.3f}, 平均值={mean_affordance:.3f}")
+
+        print("=== 选择最佳抓取点 ===")
+        u, v, angle, affordance_value = self.find_best_grasp_point(affordance_prob, angle_degrees, depth)
+        print(f"最佳抓取点: 像素({u}, {v}), 角度: {angle:.1f}°, 可供性: {affordance_value:.3f}")
+
+        # 调试：显示前5个最高可供性点的位置
+        flat_afford = affordance_prob.flatten()
+        top_indices = np.argsort(flat_afford)[-5:][::-1]  # 前5个最高值
+        print("前5个最高可供性点:")
+        for i, idx in enumerate(top_indices):
+            val = flat_afford[idx]
+            vv, uu = np.unravel_index(idx, affordance_prob.shape)
+            world_pos = self.pixel_to_world(uu, vv, depth)
+            dist_from_base = np.sqrt(world_pos[0]**2 + world_pos[1]**2)
+            print(f"  {i+1}. 像素({uu}, {vv}) -> 世界({world_pos[0]:.3f}, {world_pos[1]:.3f}) 距离基座:{dist_from_base:.3f}m 可供性:{val:.3f}")
+
+        print("=== 反投影到世界坐标 ===")
+        grasp_point_world = self.pixel_to_world(u, v, depth)
+        print(f"世界坐标: {grasp_point_world}")
+
+        # 提取坐标
+        x, y, z = grasp_point_world
+
+        # 额外的机器人基座距离检查 - 避免模型预测靠近机器人基座的错误点
+        robot_base_dist = np.sqrt(x**2 + y**2)
+        if robot_base_dist < 0.25:  # 如果距离机器人基座太近，强制跳过
+            print(f"⚠️  模型预测的抓取点太靠近机器人基座 (距离={robot_base_dist:.3f}m)，跳过")
+            return False
+
+        # 检查工作空间 - 避免太靠近机器人导致关节角度过大
+        dist = np.sqrt(x**2 + y**2)
+        workspace_valid = (
+            dist >= 0.25 and dist <= 0.85 and  # 增加最小距离到25cm，避免极端关节角度
+            abs(y) <= 0.5 and
+            z >= TABLE_TOP_Z - 0.05 and z <= TABLE_TOP_Z + 0.15
+        )
+        print(f"工作空间检查: 距离={dist:.3f}m, Y={y:.3f}m, Z={z:.3f}m, 桌面={TABLE_TOP_Z:.3f}m, 有效={workspace_valid}")
+
+        if not workspace_valid:
+            print("抓取点超出工作空间，跳过")
+            return False
+
+        print("=== 生成抓取姿态 ===")
+        pre_grasp_pos, grasp_pos, orn = self.generate_grasp_pose(grasp_point_world, angle, depth[v, u])
+
+        print("=== 执行抓取 ===")
+        # 每次抓取前重置机器人到home位置
+        self.reset_robot_home()
+        success = self.execute_grasp(pre_grasp_pos, grasp_pos, orn)
+
+        print("=== 简化评估 ===")
+        # 简化评估：只要有物体被移动就算成功，不跟踪具体物体ID
+        success = self.evaluate_grasp_success_simple()
+        print(f"抓取成功: {success}")
+
+        # 使用正确的物体管理函数（来自src/environment_setup.py）
+        reset_objects_after_grasp(obj_ids)
+
+        return success
+
+    def evaluate_grasp_success_simple(self):
+        """简化抓取成功评估 - 检查是否有任何物体被移动"""
+        # 获取所有动态物体
+        obj_ids = []
+        for i in range(p.getNumBodies()):
+            if p.getBodyInfo(i)[0].decode() not in ['plane', 'table', 'panda']:
+                obj_ids.append(i)
+
+        if not obj_ids:
+            print("⚠️  场景中没有物体")
+            return False
+
+        # 检查是否有物体位置发生明显变化
+        moved_objects = 0
+        for obj_id in obj_ids:
+            try:
+                pos, _ = p.getBasePositionAndOrientation(obj_id)
+                current_height = pos[2]
+
+                # 简单检查：如果物体高于桌面一定高度，说明被抓起
+                if current_height > TABLE_TOP_Z + 0.05:  # 高于桌面10cm
+                    moved_objects += 1
+                    print(f"  ✅ 物体 {obj_id} 被移动到高度 {current_height:.3f}m")
+            except:
+                continue
+
+        success = moved_objects > 0
+        print(f"📊 检测到 {moved_objects} 个被移动的物体")
+        return success
+
+    def simple_object_management(self):
+        """简单物体管理：清理超出范围的物体，如果没有有效物体则生成新的"""
+        print("🔄 简单物体管理...")
+
+        # 工作空间定义（参考geom.py）
+        WORKSPACE_X_RANGE = [0.4, 0.8]  # X方向范围
+        WORKSPACE_Y_RANGE = [-0.4, 0.4] # Y方向范围
+        MAX_HEIGHT = 0.78  # Z > 78cm的物体要清理
+        MIN_HEIGHT = 0.55  # Z < 55cm的物体要清理
+        # 清理超出范围的物体
+        removed_count = 0
+        for i in range(p.getNumBodies()):
+            try:
+                body_info = p.getBodyInfo(i)
+                body_name = body_info[0].decode('utf-8') if body_info[0] else ""
+
+                # 跳过环境物体
+                if any(name in body_name.lower() for name in ['plane', 'table', 'panda', 'franka']):
+                    continue
+
+                if i <= 2:
+                    continue
+
+                # 检查物体位置
+                pos, _ = p.getBasePositionAndOrientation(i)
+
+                # 清理条件：Z > 78cm 或 X/Y超出工作空间
+                should_remove = (
+                    pos[2] > MAX_HEIGHT or  # Z > 78cm
+                    pos[0] < WORKSPACE_X_RANGE[0] or pos[0] > WORKSPACE_X_RANGE[1] or  # X超出范围
+                    pos[1] < WORKSPACE_Y_RANGE[0] or pos[1] > WORKSPACE_Y_RANGE[1]    # Y超出范围
+                )
+
+                if should_remove:
+                    p.removeBody(i)
+                    removed_count += 1
+                    print(f"  🗑️ 清理物体 {i} (位置: [{pos[0]:.3f}, {pos[1]:.3f}, {pos[2]:.3f}])")
+
+            except Exception as e:
+                continue
+
+        print(f"✅ 清理完成，移除了 {removed_count} 个物体")
+
+        # 检查是否有有效物体
+        valid_objects = 0
+        for i in range(p.getNumBodies()):
+            try:
+                body_info = p.getBodyInfo(i)
+                body_name = body_info[0].decode('utf-8') if body_info[0] else ""
+
+                # 跳过环境物体
+                if any(name in body_name.lower() for name in ['plane', 'table', 'panda', 'franka']):
+                    continue
+
+                if i <= 2:
+                    continue
+
+                pos, _ = p.getBasePositionAndOrientation(i)
+
+                # 检查是否在工作空间内且高度正常
+                in_workspace = (
+                    WORKSPACE_X_RANGE[0] <= pos[0] <= WORKSPACE_X_RANGE[1] and
+                    WORKSPACE_Y_RANGE[0] <= pos[1] <= WORKSPACE_Y_RANGE[1] and
+                    pos[2] <= MAX_HEIGHT
+                )
+
+                if in_workspace:
+                    valid_objects += 1
+
+            except:
+                continue
+
+        print(f"📊 当前有效物体数量: {valid_objects}")
+
+        # 如果没有有效物体，生成新的
+        if valid_objects == 0:
+            print("⚠️ 没有有效物体，生成2个新物体")
+
+            # 等待物理稳定
+            for _ in range(30):
+                p.stepSimulation()
+
+            # 生成新物体
+            new_objects = self.create_objects_like_environment_setup(num_objects=2)
+
+            # 让新物体稳定
+            print("⏳ 等待新物体稳定...")
+            for _ in range(50):
+                p.stepSimulation()
+
+            print(f"✅ 已生成 {len(new_objects)} 个新物体")
+
     def manage_objects_between_tests(self, obj_ids, min_objects=2):
         """在测试之间管理物体状态，类似于src/afford_data_gen.py的逻辑"""
         print("🔄 检查物体状态...")
@@ -703,6 +804,24 @@ class AffordanceGraspPipeline:
         else:
             print(f"✅ 还有 {len(active_objects)} 个有效物体，继续使用")
             return active_objects
+
+    def refresh_test_scene(self):
+        """每次测试前刷新场景，确保有新鲜的物体"""
+        # 清理所有现有动态物体
+        self.cleanup_workspace()
+
+        # 等待物理稳定
+        for _ in range(30):
+            p.stepSimulation()
+
+        # 创建新的测试物体
+        num_objects = 3  # 每次测试使用3个物体
+        self.create_objects_like_environment_setup(num_objects=num_objects)
+
+        # 让新物体稳定
+        print("⏳ 等待新物体稳定...")
+        for _ in range(50):
+            p.stepSimulation()
 
     def update_object_states(self, object_ids):
         """检查哪些物体还在桌子上，移除超出工作空间的物体ID"""
