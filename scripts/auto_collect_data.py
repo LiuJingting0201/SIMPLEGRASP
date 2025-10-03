@@ -17,6 +17,7 @@ import pybullet as p
 from PIL import Image
 from pathlib import Path
 import sys
+import matplotlib.pyplot as plt
 
 # 导入工作的模块
 sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
@@ -28,6 +29,12 @@ class AutoAffordanceCollector:
     """自动化可供性数据收集器"""
     
     def __init__(self, data_dir="data/affordance_v5", num_angles=8, train_split=0.8):
+        # Convert to absolute path relative to the script's parent directory (workspace root)
+        if not Path(data_dir).is_absolute():
+            script_dir = Path(__file__).parent
+            workspace_root = script_dir.parent
+            data_dir = workspace_root / data_dir
+        
         self.data_dir = Path(data_dir)
         self.data_dir.mkdir(parents=True, exist_ok=True)
         
@@ -170,269 +177,21 @@ class AutoAffordanceCollector:
         
         # 失败的点保持为0（已经初始化为0）
         
-        # 保存数据
-        data_dir = target_dir
-        os.makedirs(data_dir, exist_ok=True)
+        # 合并所有抓取结果
+        all_results = []
+        for grasp in successful_grasps + failed_grasps:
+            all_results.append({
+                'success': grasp in successful_grasps,
+                'pixel': grasp['pixel'],
+                'world_pos': grasp['world_pos'],
+                'angle': grasp['angle']
+            })
         
-        scene_prefix = f"scene_{scene_idx:04d}"
+        # 使用统一的保存方法
+        self.save_scene_data(scene_idx, rgb_image, depth_image, affordance_map, angle_map, all_results, view_matrix, proj_matrix, target_dir, robot_id=robot_id)
         
-        # 保存图像
-        rgb_path = os.path.join(data_dir, f"{scene_prefix}_rgb.png")
-        Image.fromarray(rgb_image).save(rgb_path)
+        return True
         
-        # 保存深度图
-        depth_path = os.path.join(data_dir, f"{scene_prefix}_depth.npy")
-        np.save(depth_path, depth_image)
-        
-        # 保存可供性图
-        affordance_path = os.path.join(data_dir, f"{scene_prefix}_affordance.npy")
-        np.save(affordance_path, affordance_map)
-        
-        # 保存角度图
-        angle_path = os.path.join(data_dir, f"{scene_prefix}_angles.npy")
-        np.save(angle_path, angle_map)
-        
-        # 保存元数据（包含所有抓取尝试的详细信息）
-        meta_data = {
-            "scene_id": scene_idx,
-            "total_attempts": test_count,
-            "successful_grasps": len(successful_grasps),
-            "failed_grasps": len(failed_grasps),
-            "success_rate": success_rate,
-            "image_size": [int(rgb_image.shape[1]), int(rgb_image.shape[0])],
-            "num_objects": len(object_ids),
-            "object_ids": [int(oid) for oid in object_ids],
-            "grasp_details": {
-                "successful": [
-                    {
-                        "pixel": [int(g['pixel'][0]), int(g['pixel'][1])],
-                        "world_pos": [float(g['world_pos'][0]), float(g['world_pos'][1]), float(g['world_pos'][2])],
-                        "angle_degrees": float(np.degrees(g['angle']))
-                    } for g in successful_grasps
-                ],
-                "failed": [
-                    {
-                        "pixel": [int(g['pixel'][0]), int(g['pixel'][1])],
-                        "world_pos": [float(g['world_pos'][0]), float(g['world_pos'][1]), float(g['world_pos'][2])],
-                        "angle_degrees": float(np.degrees(g['angle']))
-                    } for g in failed_grasps
-                ]
-            }
-        }
-        
-        meta_path = os.path.join(data_dir, f"{scene_prefix}_meta.json")
-        with open(meta_path, 'w') as f:
-            json.dump(meta_data, f, indent=2)
-        
-        print(f"      💾 数据已保存: {scene_prefix}_*")
-        
-        # 返回是否有任何成功的抓取
-        return len(successful_grasps) > 0
-        """收集单个场景数据 - 修复为正确的场景定义
-        
-        正确的场景定义：
-        1. 一个场景 = 一张照片 + 多次抓取尝试
-        2. 机器人在每次抓取前回到初始位置
-        3. 照片只拍一次（机器人在初始位置时）
-        4. 多个候选点在同一场景中测试
-        """
-        try:
-            # 1. 设置环境
-            robot_id, object_ids = setup_environment(num_objects=num_objects)
-            if not object_ids:
-                return False
-            
-            # 2. 等待物体稳定
-            for _ in range(120):
-                p.stepSimulation()
-            
-                        # 3. 确保机器人在初始位置 - 使用位置控制
-            print("   🏠 重置机器人...")
-            
-            home_joints = [0, -0.785, 0, -2.356, 0, 1.571, 0.785]
-            
-            # 使用位置控制而不是直接设置关节状态，更平滑
-            for i in range(7):
-                p.setJointMotorControl2(
-                    robot_id, i, p.POSITION_CONTROL,
-                    targetPosition=home_joints[i], 
-                    force=500, 
-                    maxVelocity=2.0
-                )
-            
-            # 等待到位
-            for _ in range(200):  # 增加等待时间
-                p.stepSimulation()
-                
-                # 检查是否到位
-                all_in_position = True
-                for i in range(7):
-                    current = p.getJointState(robot_id, i)[0]
-                    if abs(current - home_joints[i]) > 0.05:  # 容差3度
-                        all_in_position = False
-                        break
-                
-                if all_in_position:
-                    break
-            
-            # 强制打开夹爪
-            p.setJointMotorControl2(robot_id, 9, p.POSITION_CONTROL, targetPosition=0.02, force=300)
-            p.setJointMotorControl2(robot_id, 10, p.POSITION_CONTROL, targetPosition=0.02, force=300)
-            for _ in range(40):
-                p.stepSimulation()
-            
-            # 验证机器人是否真的到了初始位置
-            ee_link = 11
-            current_pos = p.getLinkState(robot_id, ee_link)[0]
-            print(f"   📍 机器人末端位置: [{current_pos[0]:.3f}, {current_pos[1]:.3f}, {current_pos[2]:.3f}]")
-            
-            # 4. 拍摄照片（机器人在初始位置时）
-            print("   📷 拍摄场景照片...")
-            width, height, view_matrix, proj_matrix = set_topdown_camera()
-            rgb_image, depth_image, seg_mask = get_rgb_depth_segmentation(width, height, view_matrix, proj_matrix)
-            print(f"   📷 相机数据: RGB {rgb_image.shape}, 深度 {depth_image.shape}")
-            
-            # 5. 采样抓取候选点
-            candidates = sample_grasp_candidates(
-                depth=depth_image,
-                num_angles=self.num_angles,
-                visualize=False,
-                rgb=rgb_image,
-                view_matrix=view_matrix,
-                proj_matrix=proj_matrix,
-                seg_mask=seg_mask,
-                object_ids=object_ids
-            )
-            
-            print(f"   🔍 候选点采样结果: {len(candidates)} 个候选点")
-            
-            if not candidates:
-                print("   ❌ 没有候选点")
-                return False
-            
-            # 6. 测试多个候选点 - 这是关键修复
-            results = []
-            success_count = 0
-            test_count = min(max_attempts_per_scene, len(candidates))  # 最多测试指定数量
-            
-            print(f"   🎯 测试 {test_count} 个候选点...")
-            
-            for i, candidate in enumerate(candidates[:test_count]):
-                if len(candidate) == 4:
-                    u, v, theta_idx, theta = candidate
-                else:
-                    u, v, theta_idx = candidate
-                    theta = self.grasp_angles[theta_idx]
-                
-                world_pos = pixel_to_world(u, v, depth_image[v, u], view_matrix, proj_matrix)
-                
-                print(f"      🎯 测试 {i+1}/{test_count}: 像素({u},{v}), 角度{np.degrees(theta):.1f}°")
-                
-                # 🔑 关键：每次抓取前确保机器人在初始位置
-                if i > 0:  # 第一次不需要重置，已经在初始位置
-                    print(f"      🏠 重置机器人位置...")
-                    end_pos_before = p.getLinkState(robot_id, 8)[0]
-                    print(f"      📍 当前末端位置: [{end_pos_before[0]:.3f}, {end_pos_before[1]:.3f}, {end_pos_before[2]:.3f}]")
-                    
-                    # 使用位置控制重置
-                    home = [0, -0.785, 0, -2.356, 0, 1.571, 0.785]
-                    for j in range(7):
-                        p.setJointMotorControl2(
-                            robot_id, j, p.POSITION_CONTROL,
-                            targetPosition=home[j], 
-                            force=500, 
-                            maxVelocity=2.0
-                        )
-                    
-                    # 等待到位
-                    for _ in range(150):
-                        p.stepSimulation()
-                        
-                        # 检查是否到位
-                        all_in_position = True
-                        for j in range(7):
-                            current = p.getJointState(robot_id, j)[0]
-                            if abs(current - home[j]) > 0.05:
-                                all_in_position = False
-                                break
-                        
-                        if all_in_position:
-                            break
-                    
-                    # 强制打开夹爪
-                    p.setJointMotorControl2(robot_id, 9, p.POSITION_CONTROL, targetPosition=0.02, force=300)
-                    p.setJointMotorControl2(robot_id, 10, p.POSITION_CONTROL, targetPosition=0.02, force=300)
-                    
-                    # 等待机器人完全稳定
-                    for _ in range(150):
-                        p.stepSimulation()
-                        time.sleep(1./240.)
-                    
-                    # 验证机器人是否真的到了初始位置
-                    ee_link = 11
-                    current_pos = p.getLinkState(robot_id, ee_link)[0]
-                    print(f"      📍 当前末端位置: [{current_pos[0]:.3f}, {current_pos[1]:.3f}, {current_pos[2]:.3f}]")
-                    
-                    # 调试: 打印物体位置
-                    print(f"      🔍 重置后物体位置:")
-                    for j, obj_id in enumerate(object_ids):
-                        pos, orn = p.getBasePositionAndOrientation(obj_id)
-                        print(f"         物体 {obj_id}: 位置 [{pos[0]:.3f}, {pos[1]:.3f}, {pos[2]:.3f}]")
-                
-                # 测试抓取
-                try:
-                    success = fast_grasp_test(
-                        robot_id=robot_id,
-                        world_pos=world_pos,
-                        grasp_angle=theta,
-                        object_ids=object_ids,
-                        visualize=False,
-                        debug_mode=False
-                    )
-                    
-                    if success:
-                        success_count += 1
-                        print(f"      ✅ 成功!")
-                    else:
-                        print(f"      ❌ 失败")
-                    
-                    # 记录结果
-                    results.append({
-                        'pixel': [int(u), int(v)],
-                        'world_pos': [float(world_pos[0]), float(world_pos[1]), float(world_pos[2])],
-                        'angle': float(theta),
-                        'angle_idx': int(theta_idx),
-                        'success': success
-                    })
-                    
-                except Exception as e:
-                    print(f"      ❌ 错误: {e}")
-                    results.append({
-                        'pixel': [int(u), int(v)],
-                        'world_pos': [0, 0, 0],
-                        'angle': float(theta),
-                        'angle_idx': int(theta_idx),
-                        'success': False
-                    })
-            
-            # 7. 计算成功率并保存数据
-            success_rate = (success_count / test_count) * 100 if test_count > 0 else 0
-            print(f"   📊 成功率: {success_count}/{test_count} ({success_rate:.1f}%)")
-            
-            # 8. 生成并保存场景数据
-            affordance_map = self.create_affordance_map(rgb_image.shape[:2], results)
-            angle_map = self.create_angle_map(rgb_image.shape[:2], results)
-            
-            self.save_scene_data(scene_id, rgb_image, depth_image, affordance_map, angle_map, results)
-            print(f"      💾 数据已保存: scene_{scene_id:04d}_*")
-            print(f"   ✅ 场景 {scene_id} 完成 (成功率: {success_rate:.1f}%)")
-            
-            return True
-            
-        except Exception as e:
-            print(f"   ❌ 场景错误: {e}")
-            return False
-    
     def is_position_reachable(self, world_pos):
         """检查位置是否在机器人工作空间内"""
         x, y, z = world_pos
@@ -452,40 +211,7 @@ class AutoAffordanceCollector:
             
         return True
     
-    def is_position_reachable(self, world_pos):
-        """检查位置是否在机器人工作空间内"""
-        x, y, z = world_pos
-        
-        # 基本工作空间限制
-        distance = np.sqrt(x**2 + y**2)
-        
-        # Franka Panda的工作空间约束
-        if distance < 0.3 or distance > 0.85:  # 距离限制
-            return False
-        if abs(y) > 0.4:  # Y轴限制
-            return False
-        if z < 0.58 or z > 0.8:  # Z轴高度限制
-            return False
-        if x < 0.2 or x > 0.9:  # X轴前后限制
-            return False
-            
-        return True
-    
-    def generate_affordance_map(self, results, image_shape):
         """生成可供性热力图"""
-        affordance_map = np.zeros(image_shape, dtype=np.float32)
-        
-        for result in results:
-            if result['world_pos'][0] != 0:  # 有效的世界坐标
-                u, v = result['pixel']
-                if 0 <= v < image_shape[0] and 0 <= u < image_shape[1]:
-                    # 成功为1.0，失败为0.0
-                    affordance_map[v, u] = 1.0 if result['success'] else 0.0
-        
-        # 轻微高斯模糊来平滑热力图
-        affordance_map = cv2.GaussianBlur(affordance_map, (5, 5), 1.0)
-        return affordance_map
-    
     def generate_angle_map(self, results, image_shape):
         """生成最佳抓取角度地图"""
         angle_map = np.zeros(image_shape, dtype=np.float32)
@@ -526,41 +252,111 @@ class AutoAffordanceCollector:
         
         return angle_map
     
-    def save_scene_data(self, scene_id, rgb_image, depth_image, affordance_map, angle_map, results):
+    def save_scene_data(self, scene_id, rgb_image, depth_image, affordance_map, angle_map, results, view_matrix, proj_matrix, target_dir, seg_mask=None, robot_id=None):
         """保存场景数据"""
         scene_prefix = f"scene_{scene_id:04d}"
         
         # 保存图像
-        rgb_path = self.data_dir / f"{scene_prefix}_rgb.png"
+        rgb_path = target_dir / f"{scene_prefix}_rgb.png"
         cv2.imwrite(str(rgb_path), cv2.cvtColor(rgb_image, cv2.COLOR_RGB2BGR))
         
-        # 保存深度图
-        depth_path = self.data_dir / f"{scene_prefix}_depth.npy"
-        np.save(depth_path, depth_image)
+        # 转换深度图为相对深度
+        # 使用精确的工作空间mask (基于世界坐标)
+        height, width = depth_image.shape
+        workspace_mask = np.zeros((height, width), dtype=bool)
+        edge_mask = np.zeros((height, width), dtype=bool)
+        
+        # 为每个像素计算世界坐标并检查是否在工作空间内
+        TABLE_TOP_Z = 0.625  # 从environment_setup.py
+        for v in range(height):
+            for u in range(width):
+                # 将像素坐标转换为世界坐标
+                world_pos = pixel_to_world(u, v, depth_image[v, u], view_matrix, proj_matrix)
+                x, y, z = world_pos
+                
+                # 检查是否在工作空间内
+                dist_from_base = np.sqrt(x**2 + y**2)
+                in_workspace = (
+                    z >= TABLE_TOP_Z and z <= TABLE_TOP_Z + 0.25 and  # Z范围更保守
+                    dist_from_base >= 0.35 and dist_from_base <= 0.80 and  # 距离范围更保守
+                    abs(y) <= 0.30  # Y轴范围更严格，排除机器人基座
+                )
+                
+                workspace_mask[v, u] = in_workspace
+                
+                # 定义边缘区域：只在边缘采样桌面深度，避免物体干扰
+                if in_workspace and (dist_from_base <= 0.45 or dist_from_base >= 0.70):
+                    edge_mask[v, u] = True
+        
+        # 只使用工作空间边缘的像素计算桌面深度，避免物体干扰
+        edge_depths = depth_image[edge_mask]
+        
+        if len(edge_depths) == 0:
+            print("      ⚠️ 警告: 边缘区域没有有效像素，使用全工作空间")
+            edge_depths = depth_image[workspace_mask]
+            if len(edge_depths) == 0:
+                edge_depths = depth_image.flatten()
+        
+        # 使用边缘区域内深度最低的像素作为桌面
+        sorted_depths = np.sort(edge_depths)
+        num_table_candidates = max(50, len(sorted_depths) // 5)
+        table_pixels = sorted_depths[:num_table_candidates]
+        table_depth = np.percentile(table_pixels, 10)
+        
+        print(f"      📏 save_scene_data: 使用工作空间边缘 {num_table_candidates} 个深度像素计算桌面深度: {table_depth:.6f}")
+        
+        # 创建相对深度图：工作空间内像素使用实际相对深度，工作空间外像素设为0（桌面深度）
+        relative_depth = np.zeros_like(depth_image)
+        relative_depth[workspace_mask] = depth_image[workspace_mask] - table_depth
+        # 工作空间外像素保持为0（相当于桌面深度）
+        
+        # 保存深度图（相对深度）
+        depth_path = target_dir / f"{scene_prefix}_depth.npy"
+        np.save(depth_path, relative_depth)
         
         # 保存可供性地图
-        affordance_path = self.data_dir / f"{scene_prefix}_affordance.npy"
+        affordance_path = target_dir / f"{scene_prefix}_affordance.npy"
         np.save(affordance_path, affordance_map)
         
         # 保存角度地图
-        angle_path = self.data_dir / f"{scene_prefix}_angles.npy"
+        angle_path = target_dir / f"{scene_prefix}_angles.npy"
         np.save(angle_path, angle_map)
         
         # 保存元数据
         metadata = {
-            'scene_id': scene_id,
-            'image_shape': rgb_image.shape[:2],
+            'scene_id': int(scene_id),
+            'image_shape': [int(x) for x in rgb_image.shape[:2]],
             'num_candidates': len(results),
             'num_successful': sum(1 for r in results if r['success']),
-            'success_rate': sum(1 for r in results if r['success']) / len(results) if results else 0,
-            'candidates': results
+            'success_rate': float(sum(1 for r in results if r['success']) / len(results)) if results else 0.0,
+            'candidates': [{
+                'success': bool(r['success']),
+                'pixel': [int(r['pixel'][0]), int(r['pixel'][1])],
+                'world_pos': [float(r['world_pos'][0]), float(r['world_pos'][1]), float(r['world_pos'][2])],
+                'angle': float(r['angle'])
+            } for r in results]
         }
         
-        meta_path = self.data_dir / f"{scene_prefix}_meta.json"
+        meta_path = target_dir / f"{scene_prefix}_meta.json"
         with open(meta_path, 'w') as f:
             json.dump(metadata, f, indent=2)
         
         print(f"      💾 数据已保存: {scene_prefix}_*")
+    
+    def visualize_affordance_map(self, affordance_map, scene_id):
+        """使用jet colormap可视化可供性地图"""
+        plt.figure(figsize=(8, 6))
+        plt.imshow(affordance_map, cmap='jet', vmin=0, vmax=1)
+        plt.title(f'Affordance Map - Scene {scene_id:04d}')
+        plt.colorbar()
+        plt.axis('off')
+        plt.tight_layout()
+        
+        # 保存可视化图像
+        vis_path = target_dir / f"scene_{scene_id:04d}_affordance_vis.png"
+        plt.savefig(str(vis_path), dpi=150, bbox_inches='tight')
+        plt.close()
+        print(f"      📊 可供性地图可视化已保存: {vis_path}")
     
     def collect_dataset(self, num_scenes, num_objects_range=(2, 4), max_attempts_per_scene=25):
         """收集完整数据集"""
@@ -619,12 +415,12 @@ class AutoAffordanceCollector:
             
             # 读取场景统计信息
             import json
-            meta_file = os.path.join(target_dir, f"scene_{scene_id:04d}_meta.json")
-            if os.path.exists(meta_file):
+            meta_file = target_dir / f"scene_{scene_id:04d}_meta.json"
+            if meta_file.exists():
                 with open(meta_file, 'r') as f:
                     meta = json.load(f)
-                    scene_attempts = meta.get('total_attempts', 0)
-                    scene_successes = meta.get('successful_grasps', 0)
+                    scene_attempts = meta.get('num_candidates', 0)
+                    scene_successes = meta.get('num_successful', 0)
                     total_grasps += scene_attempts
                     total_successful_grasps += scene_successes
             
