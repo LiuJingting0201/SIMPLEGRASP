@@ -6,10 +6,9 @@ from torch.utils.data import DataLoader, Dataset, random_split
 from torchvision import transforms
 import numpy as np
 from PIL import Image
-import glob
 import json
 from torch.optim.lr_scheduler import CosineAnnealingWarmRestarts
-from torch.optim.lr_scheduler import CosineAnnealingWarmRestarts
+import glob
 
 
 class AffordanceDataset(Dataset):
@@ -159,6 +158,9 @@ class UNetLarge(nn.Module):
 
         out = self.final(d1)
         return out
+
+
+def calculate_metrics(pred_afford, true_afford, pred_angle, true_angle, valid_mask):
     """计算训练指标"""
     metrics = {}
 
@@ -199,52 +201,61 @@ def train_model():
     data_dir = './data/affordance_v5'
     full_dataset = AffordanceDataset(data_dir, is_train=True)
 
-    # 更好的 train/val 分割 (85/15 而不是 80/20)
-    train_size = int(0.85 * len(full_dataset))
+    # 300场景: 90%训练，10%验证
+    train_size = int(0.9 * len(full_dataset))
     val_size = len(full_dataset) - train_size
     train_dataset, val_dataset = random_split(full_dataset, [train_size, val_size], generator=torch.Generator().manual_seed(42))
 
-    train_loader = DataLoader(train_dataset, batch_size=4, shuffle=True)
-    val_loader = DataLoader(val_dataset, batch_size=4, shuffle=False)
+    # 更大batch_size (利用更多数据)
+    train_loader = DataLoader(train_dataset, batch_size=8, shuffle=True, num_workers=4, pin_memory=True)
+    val_loader = DataLoader(val_dataset, batch_size=8, shuffle=False, num_workers=4, pin_memory=True)
 
-    model = UNet().cuda()
+    # 使用更大模型
+    model = UNetLarge().cuda()  # 更大容量模型
 
-    # 使用 Focal Loss 处理类别不平衡 (affordance 标签极度不平衡)
+    # 加权Focal Loss处理极度不平衡的affordance标签
     class FocalLoss(nn.Module):
-        def __init__(self, alpha=0.25, gamma=2.0):
+        def __init__(self, alpha=0.25, gamma=1.0, pos_weight=50.0):  # 降低Focal Loss的激进程度，给正样本50倍权重
             super().__init__()
             self.alpha = alpha
             self.gamma = gamma
+            self.pos_weight = pos_weight
 
         def forward(self, inputs, targets):
             bce_loss = nn.functional.binary_cross_entropy_with_logits(inputs, targets, reduction='none')
             pt = torch.exp(-bce_loss)
-            focal_loss = self.alpha * (1 - pt) ** self.gamma * bce_loss
+
+            # 给正样本更高的权重来处理极度不平衡
+            weights = torch.where(targets == 1, self.pos_weight, 1.0)
+
+            focal_loss = self.alpha * weights * (1 - pt) ** self.gamma * bce_loss
             return focal_loss.mean()
 
-    criterion_afford = FocalLoss(alpha=0.25, gamma=2.0)  # 降低正样本权重
-    criterion_angle = nn.CrossEntropyLoss(reduction='none')  # 不提前reduce，后面手动处理
+    criterion_afford = FocalLoss(alpha=0.25, gamma=1.0, pos_weight=50.0)
+    criterion_angle = nn.CrossEntropyLoss(reduction='none')
 
-    optimizer = optim.AdamW(model.parameters(), lr=2e-4, weight_decay=1e-4)  # AdamW + weight decay
-    scheduler = CosineAnnealingWarmRestarts(optimizer, T_0=10, T_mult=2)  # 余弦退火重启
+    # 更激进的优化器设置
+    optimizer = optim.AdamW(model.parameters(), lr=3e-4, weight_decay=1e-4, betas=(0.9, 0.999))
+    scheduler = CosineAnnealingWarmRestarts(optimizer, T_0=15, T_mult=2)  # 更长的周期
 
     best_val_loss = float('inf')
-    patience = 15
+    patience = 25  # 更长的耐心 (数据多，需要更多训练)
     patience_counter = 0
 
-    print("🚀 开始训练自监督可供性模型...")
+    print("🚀 开始训练大规模可供性模型 (300场景)...")
     print(f"   训练集: {len(train_dataset)} 个场景")
     print(f"   验证集: {len(val_dataset)} 个场景")
-    print(f"   模型: UNet (4→37 channels)")
+    print(f"   模型: UNetLarge (4→37 channels, 增强容量)")
     print(f"   优化器: AdamW (lr={optimizer.param_groups[0]['lr']:.1e}, wd=1e-4)")
-    print(f"   损失: Focal Loss (afford) + Masked CE (angle)")
-    print("=" * 70)
+    print(f"   损失: 加权Focal Loss (afford, 正样本50x权重) + Masked CE (angle)")
+    print(f"   批大小: 8 (并行处理)")
+    print("=" * 80)
 
     for epoch in range(100):
         # ===== 训练阶段 =====
         model.train()
         train_loss = 0.0
-        train_metrics = {'afford_acc': 0, 'afford_f1': 0, 'angle_acc': 0}
+        train_metrics = {'afford_acc': 0, 'afford_precision': 0, 'afford_recall': 0, 'afford_f1': 0, 'angle_acc': 0}
 
         for x, afford, angle, valid_mask in train_loader:
             x, afford, angle, valid_mask = x.cuda(), afford.cuda(), angle.cuda(), valid_mask.cuda()
@@ -264,8 +275,8 @@ def train_model():
             else:
                 loss_angle = torch.tensor(0.0).cuda()
 
-            # 多任务损失: affordance更重要
-            loss = 3.0 * loss_afford + 0.8 * loss_angle
+            # 多任务损失: 大数据下调整权重
+            loss = 5.0 * loss_afford + 1.0 * loss_angle  # 大幅提高affordance权重
 
             optimizer.zero_grad()
             loss.backward()
@@ -287,7 +298,7 @@ def train_model():
         # ===== 验证阶段 =====
         model.eval()
         val_loss = 0.0
-        val_metrics = {'afford_acc': 0, 'afford_f1': 0, 'angle_acc': 0}
+        val_metrics = {'afford_acc': 0, 'afford_precision': 0, 'afford_recall': 0, 'afford_f1': 0, 'angle_acc': 0}
 
         with torch.no_grad():
             for x, afford, angle, valid_mask in val_loader:
@@ -305,7 +316,7 @@ def train_model():
                 else:
                     loss_angle = torch.tensor(0.0).cuda()
 
-                loss = 3.0 * loss_afford + 0.8 * loss_angle
+                loss = 5.0 * loss_afford + 1.0 * loss_angle
                 val_loss += loss.item()
 
                 batch_metrics = calculate_metrics(pred_afford, afford, pred_angle, angle, valid_mask)
@@ -370,7 +381,12 @@ def train_model():
 
     print("=" * 70)
     print("🎯 最终验证集性能:")
-    print(".3f"    print(".3f"    print(".3f"    print(".3f"    print(".3f"    print("=" * 70)
+    print(f"Afford Acc: {final_metrics['afford_acc']:.3f}")
+    print(f"Afford Precision: {final_metrics['afford_precision']:.3f}")
+    print(f"Afford Recall: {final_metrics['afford_recall']:.3f}")
+    print(f"Afford F1: {final_metrics['afford_f1']:.3f}")
+    print(f"Angle Acc: {final_metrics['angle_acc']:.3f}")
+    print("=" * 70)
     print("💡 方法论关键点:")
     print("   • 自监督数据生成: 物理仿真提供标签")
     print("   • Focal Loss: 处理极度不平衡的affordance标签")
