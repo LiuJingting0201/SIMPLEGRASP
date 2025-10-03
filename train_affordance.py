@@ -9,10 +9,11 @@ from PIL import Image
 import json
 from torch.optim.lr_scheduler import CosineAnnealingWarmRestarts
 import glob
+from torch.cuda.amp import autocast, GradScaler  # 混合精度训练
 
 
 class AffordanceDataset(Dataset):
-    def __init__(self, data_dir, is_train=True):
+    def __init__(self, data_dir, is_train=True, oversample_positives=True):
         self.data_dir = os.path.join(data_dir, 'train' if is_train else 'test')
         self.rgb_paths = sorted(glob.glob(os.path.join(self.data_dir, '*_rgb.png')))
         self.depth_paths = sorted(glob.glob(os.path.join(self.data_dir, '*_depth.npy')))
@@ -20,6 +21,32 @@ class AffordanceDataset(Dataset):
         self.angle_paths = sorted(glob.glob(os.path.join(self.data_dir, '*_angles.npy')))
         self.transform = transforms.ToTensor()
         self.num_angle_classes = 36  # 每10度一类，0-35对应0°-350°
+
+        # 过采样正样本场景
+        if is_train and oversample_positives:
+            self._oversample_positive_scenes()
+
+    def _oversample_positive_scenes(self):
+        """过采样包含正affordance像素的场景"""
+        original_indices = list(range(len(self.rgb_paths)))
+        positive_indices = []
+
+        # 找到包含正样本的场景
+        for idx in original_indices:
+            afford = np.load(self.afford_paths[idx])
+            if np.sum(afford > 0.5) > 0:  # 包含正样本
+                positive_indices.append(idx)
+
+        # 过采样正样本场景 (复制3倍)
+        oversampled_indices = original_indices + positive_indices * 3
+
+        # 更新路径列表
+        self.rgb_paths = [self.rgb_paths[i] for i in oversampled_indices]
+        self.depth_paths = [self.depth_paths[i] for i in oversampled_indices]
+        self.afford_paths = [self.afford_paths[i] for i in oversampled_indices]
+        self.angle_paths = [self.angle_paths[i] for i in oversampled_indices]
+
+        print(f"   过采样后训练场景: {len(self.rgb_paths)} (原始: {len(original_indices)}, 正样本场景: {len(positive_indices)})")
 
     def __len__(self):
         return len(self.rgb_paths)
@@ -99,30 +126,33 @@ class UNet(nn.Module):
         d1 = self.dec1(d1)
 
 class UNetLarge(nn.Module):
-    """更大容量的UNet，适合300场景训练"""
+    """更深更大的UNet，适合300场景训练，5层架构"""
     def __init__(self, in_channels=4, out_channels=37):
         super(UNetLarge, self).__init__()
-        # 更宽的通道 (1.5x)
+        # 更宽更深的通道 (1.5x深度)
         self.enc1 = self.conv_block(in_channels, 96)    # 4 → 96
         self.enc2 = self.conv_block(96, 192)            # 96 → 192
         self.enc3 = self.conv_block(192, 384)           # 192 → 384
         self.enc4 = self.conv_block(384, 768)           # 384 → 768
+        self.enc5 = self.conv_block(768, 1536)          # 768 → 1536 (新增第5层)
 
         self.pool = nn.MaxPool2d(2)
 
-        # 解码器
+        # 对应的解码器
+        self.dec4 = self.conv_block(1536, 768)          # 1536 → 768
         self.dec3 = self.conv_block(768, 384)           # 768 → 384
         self.dec2 = self.conv_block(384, 192)           # 384 → 192
         self.dec1 = self.conv_block(192, 96)            # 192 → 96
 
-        self.upconv3 = nn.ConvTranspose2d(768, 384, 2, stride=2)
-        self.upconv2 = nn.ConvTranspose2d(384, 192, 2, stride=2)
-        self.upconv1 = nn.ConvTranspose2d(192, 96, 2, stride=2)
+        self.upconv4 = nn.ConvTranspose2d(1536, 768, 2, stride=2)  # 1536 → 768
+        self.upconv3 = nn.ConvTranspose2d(768, 384, 2, stride=2)   # 768 → 384
+        self.upconv2 = nn.ConvTranspose2d(384, 192, 2, stride=2)   # 384 → 192
+        self.upconv1 = nn.ConvTranspose2d(192, 96, 2, stride=2)    # 192 → 96
 
         self.final = nn.Conv2d(96, out_channels, 1)
 
-        # Dropout for regularization
-        self.dropout = nn.Dropout2d(0.1)
+        # Dropout for regularization (更强的正则化)
+        self.dropout = nn.Dropout2d(0.15)
 
     def conv_block(self, in_c, out_c):
         return nn.Sequential(
@@ -135,17 +165,23 @@ class UNetLarge(nn.Module):
         )
 
     def forward(self, x):
-        # Encoder with skip connections
+        # Encoder with 5 levels (更深)
         e1 = self.enc1(x)
         e2 = self.enc2(self.pool(e1))
         e3 = self.enc3(self.pool(e2))
         e4 = self.enc4(self.pool(e3))
+        e5 = self.enc5(self.pool(e4))  # 新增第5层
 
-        # Decoder with skip connections
-        d3 = self.upconv3(e4)
+        # Decoder with 5 levels (对应解码)
+        d4 = self.upconv4(e5)
+        d4 = torch.cat([d4, e4], dim=1)
+        d4 = self.dec4(d4)
+        d4 = self.dropout(d4)  # 更强的dropout
+
+        d3 = self.upconv3(d4)
         d3 = torch.cat([d3, e3], dim=1)
         d3 = self.dec3(d3)
-        d3 = self.dropout(d3)  # Regularization
+        d3 = self.dropout(d3)
 
         d2 = self.upconv2(d3)
         d2 = torch.cat([d2, e2], dim=1)
@@ -206,16 +242,20 @@ def train_model():
     val_size = len(full_dataset) - train_size
     train_dataset, val_dataset = random_split(full_dataset, [train_size, val_size], generator=torch.Generator().manual_seed(42))
 
-    # 更大batch_size (利用更多数据)
-    train_loader = DataLoader(train_dataset, batch_size=8, shuffle=True, num_workers=4, pin_memory=True)
-    val_loader = DataLoader(val_dataset, batch_size=8, shuffle=False, num_workers=4, pin_memory=True)
+    # 更小batch_size + 梯度累积 (防止OOM，模拟更大batch)
+    batch_size = 4  # 从8降到4，防止5层深网络OOM
+    accumulation_steps = 2  # 梯度累积2步，相当于有效batch_size=8
+    effective_batch_size = batch_size * accumulation_steps
+
+    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, num_workers=4, pin_memory=True)
+    val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False, num_workers=4, pin_memory=True)
 
     # 使用更大模型
     model = UNetLarge().cuda()  # 更大容量模型
 
-    # 加权Focal Loss处理极度不平衡的affordance标签
+    # 加权Focal Loss + Dice Loss 处理极度不平衡的affordance标签
     class FocalLoss(nn.Module):
-        def __init__(self, alpha=0.25, gamma=1.0, pos_weight=50.0):  # 降低Focal Loss的激进程度，给正样本50倍权重
+        def __init__(self, alpha=0.25, gamma=1.0, pos_weight=50.0):
             super().__init__()
             self.alpha = alpha
             self.gamma = gamma
@@ -231,12 +271,36 @@ def train_model():
             focal_loss = self.alpha * weights * (1 - pt) ** self.gamma * bce_loss
             return focal_loss.mean()
 
-    criterion_afford = FocalLoss(alpha=0.25, gamma=1.0, pos_weight=50.0)
+    class DiceLoss(nn.Module):
+        def __init__(self, smooth=1.0):
+            super().__init__()
+            self.smooth = smooth
+
+        def forward(self, inputs, targets):
+            inputs = torch.sigmoid(inputs)
+
+            # Flatten
+            inputs = inputs.view(-1)
+            targets = targets.view(-1)
+
+            intersection = (inputs * targets).sum()
+            dice = (2. * intersection + self.smooth) / (inputs.sum() + targets.sum() + self.smooth)
+
+            return 1 - dice
+
+    # 组合损失: Focal Loss + Dice Loss
+    criterion_afford_focal = FocalLoss(alpha=0.25, gamma=1.0, pos_weight=50.0)
+    criterion_afford_dice = DiceLoss()
     criterion_angle = nn.CrossEntropyLoss(reduction='none')
 
     # 更激进的优化器设置
     optimizer = optim.AdamW(model.parameters(), lr=3e-4, weight_decay=1e-4, betas=(0.9, 0.999))
     scheduler = CosineAnnealingWarmRestarts(optimizer, T_0=15, T_mult=2)  # 更长的周期
+
+    # 混合精度训练设置
+    scaler = GradScaler()
+    # 梯度裁剪，防止梯度爆炸
+    max_grad_norm = 1.0
 
     best_val_loss = float('inf')
     patience = 25  # 更长的耐心 (数据多，需要更多训练)
@@ -245,10 +309,11 @@ def train_model():
     print("🚀 开始训练大规模可供性模型 (300场景)...")
     print(f"   训练集: {len(train_dataset)} 个场景")
     print(f"   验证集: {len(val_dataset)} 个场景")
-    print(f"   模型: UNetLarge (4→37 channels, 增强容量)")
+    print(f"   模型: UNetLarge (5层, 4→96→192→384→768→1536 channels, 增强容量)")
     print(f"   优化器: AdamW (lr={optimizer.param_groups[0]['lr']:.1e}, wd=1e-4)")
-    print(f"   损失: 加权Focal Loss (afford, 正样本50x权重) + Masked CE (angle)")
-    print(f"   批大小: 8 (并行处理)")
+    print(f"   损失: 加权Focal+Dice Loss (afford, 正样本50x权重) + Masked CE (angle)")
+    print(f"   批大小: {batch_size} (梯度累积{accumulation_steps}步, 有效batch={effective_batch_size})")
+    print(f"   混合精度: AMP启用，梯度裁剪={max_grad_norm}")
     print("=" * 80)
 
     for epoch in range(100):
@@ -257,43 +322,61 @@ def train_model():
         train_loss = 0.0
         train_metrics = {'afford_acc': 0, 'afford_precision': 0, 'afford_recall': 0, 'afford_f1': 0, 'angle_acc': 0}
 
-        for x, afford, angle, valid_mask in train_loader:
+        for batch_idx, (x, afford, angle, valid_mask) in enumerate(train_loader):
             x, afford, angle, valid_mask = x.cuda(), afford.cuda(), angle.cuda(), valid_mask.cuda()
-            pred = model(x)
-            pred_afford = pred[:, 0]    # (B, H, W)
-            pred_angle = pred[:, 1:]    # (B, 36, H, W)
 
-            # Affordance loss (所有像素，但用Focal Loss处理不平衡)
-            loss_afford = criterion_afford(pred_afford, afford)
+            # 混合精度前向传播
+            with autocast():
+                pred = model(x)
+                pred_afford = pred[:, 0]    # (B, H, W)
+                pred_angle = pred[:, 1:]    # (B, 36, H, W)
 
-            # Angle loss (只对 affordance=1 的像素计算)
-            if valid_mask.sum() > 0:
-                angle_loss_per_pixel = criterion_angle(pred_angle, angle)  # (B, H, W)
-                # 应用mask: 只在有效像素上计算损失
-                masked_angle_loss = angle_loss_per_pixel * valid_mask  # (B, H, W)
-                loss_angle = masked_angle_loss.sum() / (valid_mask.sum() + 1e-6)  # 归一化
-            else:
-                loss_angle = torch.tensor(0.0).cuda()
+                # Affordance loss: Focal Loss + Dice Loss 组合
+                loss_afford_focal = criterion_afford_focal(pred_afford, afford)
+                loss_afford_dice = criterion_afford_dice(pred_afford, afford)
+                loss_afford = 0.7 * loss_afford_focal + 0.3 * loss_afford_dice  # 70% Focal + 30% Dice
 
-            # 多任务损失: 大数据下调整权重
-            loss = 5.0 * loss_afford + 1.0 * loss_angle  # 大幅提高affordance权重
+                # Angle loss (只对 affordance=1 的像素计算)
+                if valid_mask.sum() > 0:
+                    angle_loss_per_pixel = criterion_angle(pred_angle, angle)  # (B, H, W)
+                    # 应用mask: 只在有效像素上计算损失
+                    masked_angle_loss = angle_loss_per_pixel * valid_mask  # (B, H, W)
+                    loss_angle = masked_angle_loss.sum() / (valid_mask.sum() + 1e-6)  # 归一化
+                else:
+                    loss_angle = torch.tensor(0.0).cuda()
 
-            optimizer.zero_grad()
-            loss.backward()
-            optimizer.step()
+                # 多任务损失: 大数据下调整权重
+                loss = 5.0 * loss_afford + 1.0 * loss_angle  # 大幅提高affordance权重
 
-            train_loss += loss.item()
+            # 梯度累积: 每accumulation_steps步才更新参数
+            loss = loss / accumulation_steps  # 损失按累积步数缩放
+            scaler.scale(loss).backward()
 
-            # 累积指标
-            batch_metrics = calculate_metrics(pred_afford, afford, pred_angle, angle, valid_mask)
-            for k, v in batch_metrics.items():
-                train_metrics[k] += v
+            # 每accumulation_steps步更新一次参数
+            if (batch_idx + 1) % accumulation_steps == 0:
+                # 梯度裁剪
+                scaler.unscale_(optimizer)
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_grad_norm)
 
-        # 平均训练指标
-        num_train_batches = len(train_loader)
+                # 优化器步进
+                scaler.step(optimizer)
+                scaler.update()
+                optimizer.zero_grad()
+
+            train_loss += loss.item() * accumulation_steps  # 恢复原始损失值用于记录
+
+            # 累积指标 (只在参数更新时计算，避免重复计算)
+            if (batch_idx + 1) % accumulation_steps == 0:
+                # 累积指标
+                batch_metrics = calculate_metrics(pred_afford, afford, pred_angle, angle, valid_mask)
+                for k, v in batch_metrics.items():
+                    train_metrics[k] += v
+
+        # 平均训练指标 (考虑梯度累积)
+        num_effective_batches = len(train_loader) // accumulation_steps
         for k in train_metrics:
-            train_metrics[k] /= num_train_batches
-        train_loss /= num_train_batches
+            train_metrics[k] /= max(1, num_effective_batches)  # 避免除零
+        train_loss /= max(1, num_effective_batches)
 
         # ===== 验证阶段 =====
         model.eval()
@@ -307,7 +390,9 @@ def train_model():
                 pred_afford = pred[:, 0]
                 pred_angle = pred[:, 1:]
 
-                loss_afford = criterion_afford(pred_afford, afford)
+                loss_afford_focal = criterion_afford_focal(pred_afford, afford)
+                loss_afford_dice = criterion_afford_dice(pred_afford, afford)
+                loss_afford = 0.7 * loss_afford_focal + 0.3 * loss_afford_dice
 
                 if valid_mask.sum() > 0:
                     angle_loss_per_pixel = criterion_angle(pred_angle, angle)
